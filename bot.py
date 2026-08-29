@@ -1,0 +1,308 @@
+import asyncio
+import os
+import re
+import logging
+
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, Button
+from telethon.sessions import StringSession
+from telethon.errors import RPCError
+
+import db
+
+load_dotenv()
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+ADMIN_IDS = [
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()
+]
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("session-backup-bot")
+
+LINK_RE = re.compile(r"https?://\S+")
+
+db.init_db(bootstrap_admin_ids=ADMIN_IDS)
+
+bot = TelegramClient("bot_session", API_ID, API_HASH)
+user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+# فقط یه عملیات همزمان روی اکانت سشن
+session_lock = asyncio.Lock()
+
+# حالت "منتظر ورودی متنی" برای هر ادمین، برای پنل کلیدی
+PENDING = {}
+
+SETTINGS_LABELS = {
+    "bot_x_username": "ربات X",
+    "backup_bot_username": "ربات بکاپ",
+    "channel_target": "چنل مقصد (پست)",
+    "channel_display": "نمایش آیدی چنل",
+    "upload_btn_text": "متن دکمه آپلود",
+    "single_btn_text": "متن دکمه تکی",
+    "back_btn_text": "متن دکمه بازگشت",
+}
+
+
+# ---------------------------------------------------------------- helpers
+def is_admin(user_id: int) -> bool:
+    return db.is_admin(user_id)
+
+
+def extract_link(text: str) -> str:
+    if not text:
+        raise RuntimeError("پیام خالی بود، لینکی توش نبود")
+    m = LINK_RE.search(text)
+    if not m:
+        raise RuntimeError(f"لینکی توی پاسخ پیدا نشد:\n{text}")
+    return m.group(0)
+
+
+async def click_button(message, text_fragment: str):
+    if not message.buttons:
+        raise RuntimeError("این پیام دکمه‌ای نداشت")
+    for row in message.buttons:
+        for btn in row:
+            if text_fragment and text_fragment in (btn.text or ""):
+                await message.click(text=btn.text)
+                return
+    raise RuntimeError(f"دکمه‌ی «{text_fragment}» پیدا نشد")
+
+
+# ---------------------------------------------------------------- panel UI
+def main_menu_buttons():
+    rows = []
+    for key, label in SETTINGS_LABELS.items():
+        rows.append([Button.inline(label, data=f"set:{key}")])
+    rows.append([Button.inline("مدیریت ادمین‌ها", data="menu:admins")])
+    rows.append([Button.inline("نمایش کامل تنظیمات", data="menu:show")])
+    rows.append([Button.inline("بستن", data="menu:close")])
+    return rows
+
+
+def admins_menu_buttons():
+    rows = [[Button.inline(f"❌ حذف {a}", data=f"admin:rm:{a}")] for a in db.list_admins()]
+    rows.append([Button.inline("➕ افزودن ادمین", data="admin:add")])
+    rows.append([Button.inline("بازگشت", data="menu:main")])
+    return rows
+
+
+@bot.on(events.NewMessage(pattern="/start"))
+async def start_handler(event):
+    if not is_admin(event.sender_id):
+        await event.reply("دسترسی نداری.")
+        return
+    await event.reply(
+        "آماده‌ام. یه فایل بفرست تا لینک بکاپ بگیرم، یا از پنل زیر همه چیزو تنظیم کن:",
+        buttons=main_menu_buttons(),
+    )
+
+
+@bot.on(events.NewMessage(pattern="/panel"))
+async def panel_handler(event):
+    if not is_admin(event.sender_id):
+        return
+    await event.reply("پنل تنظیمات:", buttons=main_menu_buttons())
+
+
+@bot.on(events.CallbackQuery())
+async def callback_handler(event):
+    if not is_admin(event.sender_id):
+        await event.answer("دسترسی نداری", alert=True)
+        return
+
+    data = event.data.decode()
+
+    if data == "menu:main":
+        PENDING.pop(event.sender_id, None)
+        await event.edit("پنل تنظیمات:", buttons=main_menu_buttons())
+        return
+
+    if data == "menu:close":
+        PENDING.pop(event.sender_id, None)
+        await event.edit("بسته شد. برای باز کردن دوباره /panel رو بزن.")
+        return
+
+    if data == "menu:show":
+        cfg = db.get_all_settings()
+        lines = [f"{SETTINGS_LABELS.get(k, k)}: {v or '—'}" for k, v in cfg.items()]
+        lines.append(f"ادمین‌ها: {db.list_admins()}")
+        await event.edit("\n".join(lines), buttons=[[Button.inline("بازگشت", data="menu:main")]])
+        return
+
+    if data == "menu:admins":
+        PENDING.pop(event.sender_id, None)
+        await event.edit("مدیریت ادمین‌ها:", buttons=admins_menu_buttons())
+        return
+
+    if data.startswith("admin:rm:"):
+        uid = int(data.split(":")[2])
+        db.remove_admin(uid)
+        await event.edit(f"ادمین {uid} حذف شد.\n\nمدیریت ادمین‌ها:", buttons=admins_menu_buttons())
+        return
+
+    if data == "admin:add":
+        PENDING[event.sender_id] = "add_admin"
+        await event.edit(
+            "آیدی عددی ادمین جدید رو بفرست:",
+            buttons=[[Button.inline("انصراف", data="menu:admins")]],
+        )
+        return
+
+    if data.startswith("set:"):
+        key = data.split(":", 1)[1]
+        PENDING[event.sender_id] = key
+        current = db.get_setting(key)
+        label = SETTINGS_LABELS.get(key, key)
+        await event.edit(
+            f"{label}\nمقدار فعلی: {current or '—'}\n\nمقدار جدید رو بفرست:",
+            buttons=[[Button.inline("انصراف", data="menu:main")]],
+        )
+        return
+
+
+# باید قبل از template_handler ثبت بشه تا اول این چک بشه
+@bot.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith("/")))
+async def pending_input_handler(event):
+    if not is_admin(event.sender_id):
+        return
+    pending_key = PENDING.get(event.sender_id)
+    if not pending_key:
+        return  # چیزی منتظر نیست، بذار هندلرهای بعدی پردازش کنن
+
+    value = event.raw_text.strip()
+
+    if pending_key == "add_admin":
+        if not value.isdigit():
+            await event.reply("باید فقط آیدی عددی بفرستی.")
+            raise events.StopPropagation
+        db.add_admin(int(value))
+        PENDING.pop(event.sender_id, None)
+        await event.reply(f"ادمین {value} اضافه شد.", buttons=main_menu_buttons())
+        raise events.StopPropagation
+
+    db.set_setting(pending_key, value)
+    PENDING.pop(event.sender_id, None)
+    label = SETTINGS_LABELS.get(pending_key, pending_key)
+    await event.reply(f"{label} تنظیم شد روی:\n{value}", buttons=main_menu_buttons())
+    raise events.StopPropagation
+
+
+# ---------------------------------------------------------------- core flow
+async def get_link_from_bot_x(file_path: str) -> str:
+    bot_x = db.get_setting("bot_x_username")
+    if not bot_x:
+        raise RuntimeError("اول از پنل، ربات X رو تنظیم کن")
+
+    async with user.conversation(bot_x, timeout=180) as conv:
+        await user.send_file(bot_x, file_path)
+        resp = await conv.get_response()
+        return extract_link(resp.raw_text)
+
+
+async def get_backup_link(link: str) -> str:
+    backup_bot = db.get_setting("backup_bot_username")
+    if not backup_bot:
+        raise RuntimeError("اول از پنل، ربات بکاپ رو تنظیم کن")
+
+    upload_btn = db.get_setting("upload_btn_text")
+    single_btn = db.get_setting("single_btn_text")
+    back_btn = db.get_setting("back_btn_text")
+
+    async with user.conversation(backup_bot, timeout=180) as conv:
+        await conv.send_message("/admin")
+        resp = await conv.get_response()
+
+        await click_button(resp, upload_btn)
+        resp = await conv.get_response()
+
+        await click_button(resp, single_btn)
+        resp = await conv.get_response()  # منتظر پرامپت لینک
+
+        await conv.send_message(link)
+        resp = await conv.get_response()  # پیام حاوی لینک بکاپ
+
+        backup_link = extract_link(resp.raw_text)
+
+        try:
+            await click_button(resp, back_btn)
+        except Exception as e:
+            log.warning("back button click failed: %s", e)
+
+        return backup_link
+
+
+async def process_file(event):
+    status = await event.reply("در حال پردازش، صبر کن...")
+    file_path = None
+    try:
+        file_path = await bot.download_media(event.message)
+        async with session_lock:
+            link1 = await get_link_from_bot_x(file_path)
+            backup_link = await get_backup_link(link1)
+
+        db.set_last_link(event.sender_id, backup_link)
+        await status.edit(f"لینک بکاپ:\n{backup_link}")
+    except Exception as e:
+        log.exception("process_file failed")
+        await status.edit(f"خطا: {e}")
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+
+def build_channel_message(raw_text: str, link: str, channel_display: str) -> str:
+    text = raw_text.replace("ایدی چنل", channel_display or "")
+    text = text.replace("مشاهده", f'<a href="{link}">مشاهده</a>')
+    return text
+
+
+# ---------------------------------------------------------------- file intake
+@bot.on(events.NewMessage(func=lambda e: e.file is not None and not e.message.text))
+async def file_handler(event):
+    if not is_admin(event.sender_id):
+        return
+    await process_file(event)
+
+
+# ---------------------------------------------------------------- template -> channel post
+@bot.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith("/")))
+async def template_handler(event):
+    if not is_admin(event.sender_id):
+        return
+    if "مشاهده" not in event.text:
+        return
+
+    link = db.get_last_link(event.sender_id)
+    if not link:
+        await event.reply("هنوز لینک بکاپی برای این چت ثبت نشده؛ اول یه فایل بفرست.")
+        return
+
+    channel_target = db.get_setting("channel_target")
+    channel_display = db.get_setting("channel_display")
+    if not channel_target:
+        await event.reply("اول از پنل، چنل مقصد رو تنظیم کن.")
+        return
+
+    final_text = build_channel_message(event.text, link, channel_display)
+
+    try:
+        await bot.send_message(channel_target, final_text, parse_mode="html", link_preview=False)
+        await event.reply("پست شد توی چنل.")
+    except RPCError as e:
+        await event.reply(f"ارسال به چنل با خطا مواجه شد: {e}")
+
+
+# ---------------------------------------------------------------- run
+async def main():
+    await bot.start(bot_token=BOT_TOKEN)
+    await user.start()
+    log.info("bot & session client started")
+    await asyncio.gather(bot.run_until_disconnected(), user.run_until_disconnected())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
