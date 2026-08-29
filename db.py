@@ -1,7 +1,11 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.sqlite3")
+# روی ریلوی حتما این رو با یه Volume مقداردهی کن (مثلا /data/data.sqlite3)
+# وگرنه سر هر ری‌دیپلوی، سشن و تنظیمات پاک میشن.
+DB_PATH = os.environ.get(
+    "DB_PATH", os.path.join(os.path.dirname(__file__), "data.sqlite3")
+)
 
 DEFAULTS = {
     "bot_x_username": "",
@@ -11,6 +15,7 @@ DEFAULTS = {
     "upload_btn_text": "آپلود فایل",
     "single_btn_text": "تکی",
     "back_btn_text": "بازگشت به منو اصلی",
+    "session_string": "",       # با پنل داخل ربات (🔑 ورود سشن جدید) پر میشه
 }
 
 

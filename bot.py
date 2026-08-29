@@ -6,7 +6,13 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import RPCError
+from telethon.errors import (
+    RPCError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+)
 
 import db
 
@@ -15,7 +21,7 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+ENV_SESSION_STRING = os.environ.get("SESSION_STRING", "")  # فقط برای اولین بوت اختیاریه
 ADMIN_IDS = [
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()
 ]
@@ -27,14 +33,13 @@ LINK_RE = re.compile(r"https?://\S+")
 
 db.init_db(bootstrap_admin_ids=ADMIN_IDS)
 
-bot = TelegramClient("bot_session", API_ID, API_HASH)
-user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot = TelegramClient(StringSession(), API_ID, API_HASH)
+user = TelegramClient(StringSession(), API_ID, API_HASH)  # تا لاگین نشه وصل نیست
 
-# فقط یه عملیات همزمان روی اکانت سشن
 session_lock = asyncio.Lock()
 
-# حالت "منتظر ورودی متنی" برای هر ادمین، برای پنل کلیدی
-PENDING = {}
+PENDING = {}          # user_id -> کلید تنظیمی که منتظر مقدار متنیشیم
+LOGIN_SESSIONS = {}    # user_id -> {client, phone, phone_code_hash, code}
 
 SETTINGS_LABELS = {
     "bot_x_username": "ربات X",
@@ -72,11 +77,29 @@ async def click_button(message, text_fragment: str):
     raise RuntimeError(f"دکمه‌ی «{text_fragment}» پیدا نشد")
 
 
+async def reconnect_user_client(session_string: str):
+    """کلاینت سشن (یوزربات) رو با استرینگ جدید وصل/جایگزین میکنه."""
+    global user
+    try:
+        if user.is_connected():
+            await user.disconnect()
+    except Exception:
+        pass
+    user = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    await user.start()
+
+
+def session_connected() -> bool:
+    return user.is_connected()
+
+
 # ---------------------------------------------------------------- panel UI
 def main_menu_buttons():
     rows = []
     for key, label in SETTINGS_LABELS.items():
         rows.append([Button.inline(label, data=f"set:{key}")])
+    status = "متصل ✅" if session_connected() else "قطع ❌"
+    rows.append([Button.inline(f"🔑 ورود سشن جدید (وضعیت: {status})", data="login:start")])
     rows.append([Button.inline("مدیریت ادمین‌ها", data="menu:admins")])
     rows.append([Button.inline("نمایش کامل تنظیمات", data="menu:show")])
     rows.append([Button.inline("بستن", data="menu:close")])
@@ -88,6 +111,26 @@ def admins_menu_buttons():
     rows.append([Button.inline("➕ افزودن ادمین", data="admin:add")])
     rows.append([Button.inline("بازگشت", data="menu:main")])
     return rows
+
+
+def code_keypad(code_so_far: str):
+    rows, row = [], []
+    for d in ["1", "2", "3", "4", "5", "6", "7", "8", "9"]:
+        row.append(Button.inline(d, data=f"login:digit:{d}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    rows.append([
+        Button.inline("0", data="login:digit:0"),
+        Button.inline("⌫", data="login:back"),
+        Button.inline("✅ تایید", data="login:submit"),
+    ])
+    rows.append([Button.inline("❌ انصراف", data="login:cancel")])
+    return rows
+
+
+def masked_code(code: str) -> str:
+    return " ".join(list(code)) if code else "—"
 
 
 @bot.on(events.NewMessage(pattern="/start"))
@@ -108,6 +151,46 @@ async def panel_handler(event):
     await event.reply("پنل تنظیمات:", buttons=main_menu_buttons())
 
 
+# ---------------------------------------------------------------- login wizard
+async def start_login_phone(event, phone: str):
+    admin_id = event.sender_id
+    try:
+        temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await temp_client.connect()
+        sent = await temp_client.send_code_request(phone)
+    except Exception as e:
+        await event.respond(f"خطا در ارسال کد: {e}", buttons=main_menu_buttons())
+        return
+
+    LOGIN_SESSIONS[admin_id] = {
+        "client": temp_client,
+        "phone": phone,
+        "phone_code_hash": sent.phone_code_hash,
+        "code": "",
+    }
+    await event.respond(
+        f"کد به {phone} ارسال شد.\nکد وارد شده: —\n\nبا دکمه‌های زیر وارد کن:",
+        buttons=code_keypad(""),
+    )
+
+
+async def finish_login(edit_target, admin_id: int):
+    sess = LOGIN_SESSIONS.pop(admin_id, None)
+    if not sess:
+        return
+    temp_client = sess["client"]
+    session_string = temp_client.session.save()
+    db.set_setting("session_string", session_string)
+    await temp_client.disconnect()
+    await reconnect_user_client(session_string)
+
+    text = "ورود موفق بود، سشن ذخیره و وصل شد."
+    if hasattr(edit_target, "edit"):
+        await edit_target.edit(text, buttons=main_menu_buttons())
+    else:
+        await edit_target.respond(text, buttons=main_menu_buttons())
+
+
 @bot.on(events.CallbackQuery())
 async def callback_handler(event):
     if not is_admin(event.sender_id):
@@ -115,26 +198,32 @@ async def callback_handler(event):
         return
 
     data = event.data.decode()
+    admin_id = event.sender_id
 
     if data == "menu:main":
-        PENDING.pop(event.sender_id, None)
+        PENDING.pop(admin_id, None)
         await event.edit("پنل تنظیمات:", buttons=main_menu_buttons())
         return
 
     if data == "menu:close":
-        PENDING.pop(event.sender_id, None)
+        PENDING.pop(admin_id, None)
         await event.edit("بسته شد. برای باز کردن دوباره /panel رو بزن.")
         return
 
     if data == "menu:show":
         cfg = db.get_all_settings()
-        lines = [f"{SETTINGS_LABELS.get(k, k)}: {v or '—'}" for k, v in cfg.items()]
+        lines = []
+        for k, v in cfg.items():
+            if k == "session_string":
+                continue
+            lines.append(f"{SETTINGS_LABELS.get(k, k)}: {v or '—'}")
+        lines.append(f"وضعیت سشن: {'متصل ✅' if session_connected() else 'قطع ❌'}")
         lines.append(f"ادمین‌ها: {db.list_admins()}")
         await event.edit("\n".join(lines), buttons=[[Button.inline("بازگشت", data="menu:main")]])
         return
 
     if data == "menu:admins":
-        PENDING.pop(event.sender_id, None)
+        PENDING.pop(admin_id, None)
         await event.edit("مدیریت ادمین‌ها:", buttons=admins_menu_buttons())
         return
 
@@ -145,7 +234,7 @@ async def callback_handler(event):
         return
 
     if data == "admin:add":
-        PENDING[event.sender_id] = "add_admin"
+        PENDING[admin_id] = "add_admin"
         await event.edit(
             "آیدی عددی ادمین جدید رو بفرست:",
             buttons=[[Button.inline("انصراف", data="menu:admins")]],
@@ -154,7 +243,7 @@ async def callback_handler(event):
 
     if data.startswith("set:"):
         key = data.split(":", 1)[1]
-        PENDING[event.sender_id] = key
+        PENDING[admin_id] = key
         current = db.get_setting(key)
         label = SETTINGS_LABELS.get(key, key)
         await event.edit(
@@ -163,13 +252,94 @@ async def callback_handler(event):
         )
         return
 
+    if data.startswith("login:"):
+        action = data.split(":", 1)[1]
+
+        if action == "start":
+            LOGIN_SESSIONS.pop(admin_id, None)
+            PENDING[admin_id] = "login_phone"
+            await event.edit(
+                "شماره تلفن اکانت سشن رو با فرمت بین‌المللی بفرست (مثلا +989123456789):",
+                buttons=[[Button.inline("انصراف", data="menu:main")]],
+            )
+            return
+
+        if action == "cancel":
+            PENDING.pop(admin_id, None)
+            sess = LOGIN_SESSIONS.pop(admin_id, None)
+            if sess:
+                try:
+                    await sess["client"].disconnect()
+                except Exception:
+                    pass
+            await event.edit("لغو شد.", buttons=main_menu_buttons())
+            return
+
+        sess = LOGIN_SESSIONS.get(admin_id)
+        if not sess:
+            await event.answer("جلسه‌ی ورود پیدا نشد، دوباره از پنل شروع کن.", alert=True)
+            return
+
+        if action.startswith("digit:"):
+            sess["code"] += action.split(":")[1]
+            await event.edit(
+                f"کد به {sess['phone']} ارسال شد.\nکد وارد شده: {masked_code(sess['code'])}\n\nبا دکمه‌های زیر وارد کن:",
+                buttons=code_keypad(sess["code"]),
+            )
+            return
+
+        if action == "back":
+            sess["code"] = sess["code"][:-1]
+            await event.edit(
+                f"کد به {sess['phone']} ارسال شد.\nکد وارد شده: {masked_code(sess['code'])}\n\nبا دکمه‌های زیر وارد کن:",
+                buttons=code_keypad(sess["code"]),
+            )
+            return
+
+        if action == "submit":
+            code = sess["code"]
+            if not code:
+                await event.answer("هنوز کدی وارد نکردی", alert=True)
+                return
+            try:
+                await sess["client"].sign_in(
+                    phone=sess["phone"], code=code, phone_code_hash=sess["phone_code_hash"]
+                )
+            except SessionPasswordNeededError:
+                PENDING[admin_id] = "login_password"
+                await event.edit(
+                    "این اکانت تایید دو مرحله‌ای داره.\n"
+                    "رمز (2FA) رو به صورت پیام متنی بفرست (بعد از خوندنش پیامت پاک میشه):",
+                    buttons=[[Button.inline("انصراف", data="login:cancel")]],
+                )
+                return
+            except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+                sess["code"] = ""
+                await event.edit(
+                    f"کد اشتباه یا منقضی شده، دوباره وارد کن:\n{e}",
+                    buttons=code_keypad(""),
+                )
+                return
+            except Exception as e:
+                LOGIN_SESSIONS.pop(admin_id, None)
+                try:
+                    await sess["client"].disconnect()
+                except Exception:
+                    pass
+                await event.edit(f"خطا: {e}", buttons=main_menu_buttons())
+                return
+
+            await finish_login(event, admin_id)
+            return
+
 
 # باید قبل از template_handler ثبت بشه تا اول این چک بشه
 @bot.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith("/")))
 async def pending_input_handler(event):
     if not is_admin(event.sender_id):
         return
-    pending_key = PENDING.get(event.sender_id)
+    admin_id = event.sender_id
+    pending_key = PENDING.get(admin_id)
     if not pending_key:
         return  # چیزی منتظر نیست، بذار هندلرهای بعدی پردازش کنن
 
@@ -180,12 +350,47 @@ async def pending_input_handler(event):
             await event.reply("باید فقط آیدی عددی بفرستی.")
             raise events.StopPropagation
         db.add_admin(int(value))
-        PENDING.pop(event.sender_id, None)
+        PENDING.pop(admin_id, None)
         await event.reply(f"ادمین {value} اضافه شد.", buttons=main_menu_buttons())
         raise events.StopPropagation
 
+    if pending_key == "login_phone":
+        PENDING.pop(admin_id, None)
+        await start_login_phone(event, value)
+        raise events.StopPropagation
+
+    if pending_key == "login_password":
+        sess = LOGIN_SESSIONS.get(admin_id)
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        if not sess:
+            PENDING.pop(admin_id, None)
+            await event.respond("جلسه‌ی ورود پیدا نشد، دوباره از پنل شروع کن.", buttons=main_menu_buttons())
+            raise events.StopPropagation
+        try:
+            await sess["client"].sign_in(password=value)
+        except PasswordHashInvalidError:
+            await event.respond("رمز اشتباهه، دوباره بفرست:", buttons=[[Button.inline("انصراف", data="login:cancel")]])
+            raise events.StopPropagation
+        except Exception as e:
+            PENDING.pop(admin_id, None)
+            LOGIN_SESSIONS.pop(admin_id, None)
+            try:
+                await sess["client"].disconnect()
+            except Exception:
+                pass
+            await event.respond(f"خطا: {e}", buttons=main_menu_buttons())
+            raise events.StopPropagation
+
+        PENDING.pop(admin_id, None)
+        await finish_login(event, admin_id)
+        raise events.StopPropagation
+
+    # حالت عادی: یکی از تنظیمات ساده
     db.set_setting(pending_key, value)
-    PENDING.pop(event.sender_id, None)
+    PENDING.pop(admin_id, None)
     label = SETTINGS_LABELS.get(pending_key, pending_key)
     await event.reply(f"{label} تنظیم شد روی:\n{value}", buttons=main_menu_buttons())
     raise events.StopPropagation
@@ -193,6 +398,9 @@ async def pending_input_handler(event):
 
 # ---------------------------------------------------------------- core flow
 async def get_link_from_bot_x(file_path: str) -> str:
+    if not session_connected():
+        raise RuntimeError("سشن وصل نیست؛ از پنل روی «ورود سشن جدید» بزن")
+
     bot_x = db.get_setting("bot_x_username")
     if not bot_x:
         raise RuntimeError("اول از پنل، ربات X رو تنظیم کن")
@@ -299,9 +507,19 @@ async def template_handler(event):
 # ---------------------------------------------------------------- run
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    await user.start()
-    log.info("bot & session client started")
-    await asyncio.gather(bot.run_until_disconnected(), user.run_until_disconnected())
+
+    stored_session = db.get_setting("session_string") or ENV_SESSION_STRING
+    if stored_session:
+        try:
+            await reconnect_user_client(stored_session)
+            log.info("session client connected")
+        except Exception as e:
+            log.warning("could not connect stored session: %s", e)
+    else:
+        log.warning("سشنی ثبت نشده - از /panel روی «ورود سشن جدید» بزن")
+
+    log.info("bot started")
+    await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
