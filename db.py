@@ -12,6 +12,9 @@ DEFAULTS = {
     "backup_bot_username": "",
     "trigger_word": "مشاهده",   # کلمه‌ای که توی پیام تبدیل به لینک بکاپ میشه
     "session_string": "",       # با پنل داخل ربات (🔑 ورود سشن جدید) پر میشه
+    "watch_interval_seconds": "3600",  # حداقل فاصله بین دو دور دانلود از چنل‌های مانیتور
+    "watch_max_per_day": "5",          # حداکثر تعداد فایل در ۲۴ ساعت از چنل‌های مانیتور
+    "post_template": "",               # قالب پیام برای پست خودکار (شامل «ایدی چنل» و کلمه‌ی تریگر)
 }
 
 
@@ -38,6 +41,19 @@ def init_db(bootstrap_admin_ids=None):
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "target TEXT NOT NULL, "
         "display TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS watched_channels ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "target TEXT NOT NULL, "
+        "title TEXT, "
+        "added_at INTEGER)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS downloaded ("
+        "file_unique_id TEXT PRIMARY KEY, "
+        "chat_id TEXT, "
+        "downloaded_at INTEGER)"
     )
     conn.commit()
 
@@ -165,3 +181,67 @@ def remove_channel(channel_id):
     conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------- watched channels (source)
+def add_watched_channel(target, title):
+    conn = _conn()
+    cur = conn.execute(
+        "INSERT INTO watched_channels (target, title, added_at) VALUES (?, ?, strftime('%s','now'))",
+        (str(target), title),
+    )
+    conn.commit()
+    channel_id = cur.lastrowid
+    conn.close()
+    return channel_id
+
+
+def list_watched_channels():
+    conn = _conn()
+    rows = conn.execute("SELECT id, target, title FROM watched_channels ORDER BY id").fetchall()
+    conn.close()
+    return [{"id": r["id"], "target": r["target"], "title": r["title"]} for r in rows]
+
+
+def remove_watched_channel(channel_id):
+    conn = _conn()
+    conn.execute("DELETE FROM watched_channels WHERE id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------- download dedup / rate limit
+def already_downloaded(file_unique_id):
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM downloaded WHERE file_unique_id = ?", (file_unique_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_downloaded(file_unique_id, chat_id):
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO downloaded (file_unique_id, chat_id, downloaded_at) "
+        "VALUES (?, ?, strftime('%s','now'))",
+        (file_unique_id, str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def downloads_in_last_24h():
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM downloaded WHERE downloaded_at >= strftime('%s','now') - 86400"
+    ).fetchone()
+    conn.close()
+    return row["c"]
+
+
+def last_download_time():
+    conn = _conn()
+    row = conn.execute("SELECT MAX(downloaded_at) AS m FROM downloaded").fetchone()
+    conn.close()
+    return row["m"] or 0

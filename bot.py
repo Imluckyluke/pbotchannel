@@ -1,17 +1,22 @@
 import asyncio
 import os
 import re
+import time
 import logging
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import (
     RPCError,
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PasswordHashInvalidError,
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
 )
 
 import db
@@ -30,6 +35,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("session-backup-bot")
 
 LINK_RE = re.compile(r"https?://\S+")
+INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_]+)")
+DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 
 db.init_db(bootstrap_admin_ids=ADMIN_IDS)
 
@@ -45,6 +52,9 @@ SETTINGS_LABELS = {
     "bot_x_username": "ربات X",
     "backup_bot_username": "ربات بکاپ",
     "trigger_word": "کلمه‌ی تبدیل به لینک",
+    "watch_interval_seconds": "فاصله زمانی مانیتور (ثانیه)",
+    "watch_max_per_day": "سقف روزانه مانیتور (فایل)",
+    "post_template": "قالب پشتیبان (وقتی پست مبدا کپشن نداره)",
 }
 
 PENDING_TEMPLATE = {}   # user_id -> {"text": ..., "link": ...} تا وقتی کانال انتخاب بشه
@@ -95,6 +105,28 @@ def session_connected() -> bool:
     return user.is_connected()
 
 
+async def join_from_identifier(identifier: str) -> bool:
+    """identifier: لینک t.me، یوزرنیم @، یا آیدی عددی چنلی که سشن از قبل عضوشه."""
+    m = INVITE_LINK_RE.search(identifier)
+    try:
+        if m and ("/+" in identifier or "joinchat" in identifier):
+            await user(ImportChatInviteRequest(m.group(1)))
+        elif m:
+            await user(JoinChannelRequest(m.group(1)))
+        elif identifier.startswith("@"):
+            await user(JoinChannelRequest(identifier))
+        else:
+            return True  # آیدی عددی: فرض میکنیم از قبل عضوه
+        return True
+    except UserAlreadyParticipantError:
+        return True
+    except InviteHashExpiredError:
+        return False
+    except Exception as e:
+        log.warning("join failed for %s: %s", identifier, e)
+        return False
+
+
 # ---------------------------------------------------------------- panel UI
 def main_menu_buttons():
     rows = []
@@ -108,6 +140,7 @@ def main_menu_buttons():
     rows.append([Button.inline(f"ورود با شماره ({status})", data="login:start", style="success" if connected else "danger")])
     rows.append([Button.inline("ورود مستقیم با Session String", data="login:string", style="primary")])
     rows.append([Button.inline(f"مدیریت کانال‌ها ({len(db.list_channels())})", data="menu:channels", style="primary")])
+    rows.append([Button.inline(f"📡 چنل‌های مانیتور ({len(db.list_watched_channels())})", data="menu:watchchannels", style="primary")])
     rows.append([Button.inline(f"مدیریت ادمین‌ها ({len(db.list_admins())})", data="menu:admins", style="primary")])
     rows.append([Button.inline("نمایش کامل تنظیمات", data="menu:show")])
     rows.append([Button.inline("بستن", data="menu:close", style="danger")])
@@ -127,6 +160,16 @@ def channels_menu_buttons():
         for c in db.list_channels()
     ]
     rows.append([Button.inline("افزودن کانال", data="channel:add", style="success")])
+    rows.append([Button.inline("بازگشت", data="menu:main")])
+    return rows
+
+
+def watch_channels_menu_buttons():
+    rows = [
+        [Button.inline(f"حذف {c['title'] or c['target']}", data=f"watchch:rm:{c['id']}", style="danger")]
+        for c in db.list_watched_channels()
+    ]
+    rows.append([Button.inline("افزودن چنل مانیتور", data="watchch:add", style="success")])
     rows.append([Button.inline("بازگشت", data="menu:main")])
     return rows
 
@@ -251,6 +294,11 @@ async def callback_handler(event):
             lines.append("کانال‌ها: " + ", ".join(c["display"] or c["target"] for c in chans))
         else:
             lines.append("کانال‌ها: —")
+        wchans = db.list_watched_channels()
+        if wchans:
+            lines.append("چنل‌های مانیتور: " + ", ".join(c["title"] or c["target"] for c in wchans))
+        else:
+            lines.append("چنل‌های مانیتور: —")
         await event.edit("\n".join(lines), buttons=[[Button.inline("بازگشت", data="menu:main")]])
         return
 
@@ -290,6 +338,27 @@ async def callback_handler(event):
             await event.edit(f"پست شد توی «{channel['display'] or channel['target']}».")
         except Exception as e:
             await event.edit(f"ارسال به کانال با خطا مواجه شد: {e}")
+        return
+
+    if data == "menu:watchchannels":
+        PENDING.pop(admin_id, None)
+        PENDING_MSG.pop(admin_id, None)
+        await event.edit("چنل‌های مانیتور (که ازشون فایل جدید گرفته میشه):", buttons=watch_channels_menu_buttons())
+        return
+
+    if data == "watchch:add":
+        PENDING[admin_id] = "add_watch_channel"
+        PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
+        await event.edit(
+            "لینک دعوت، یوزرنیم (@channel) یا آیدی عددی چنل مبدا رو بفرست:",
+            buttons=[[Button.inline("انصراف", data="menu:watchchannels", style="danger")]],
+        )
+        return
+
+    if data.startswith("watchch:rm:"):
+        cid = int(data.split(":")[2])
+        db.remove_watched_channel(cid)
+        await event.edit("چنل مانیتور حذف شد.\n\nچنل‌های مانیتور:", buttons=watch_channels_menu_buttons())
         return
 
     if data == "menu:admins":
@@ -467,6 +536,27 @@ async def pending_input_handler(event):
         PENDING_MSG.pop(admin_id, None)
         raise events.StopPropagation
 
+    if pending_key == "add_watch_channel":
+        PENDING.pop(admin_id, None)
+        if not session_connected():
+            await send_or_edit(admin_id, event, "اول باید سشن وصل باشه (از پنل «ورود با شماره» یا Session String بزن).", buttons=watch_channels_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
+            raise events.StopPropagation
+        joined = await join_from_identifier(value)
+        if not joined:
+            await send_or_edit(admin_id, event, "عضویت انجام نشد. لینک رو چک کن.", buttons=watch_channels_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
+            raise events.StopPropagation
+        try:
+            target = value if not value.lstrip("-").isdigit() else int(value)
+            entity = await user.get_entity(target)
+            db.add_watched_channel(entity.id, getattr(entity, "title", value))
+            await send_or_edit(admin_id, event, f"چنل مانیتور اضافه شد: {getattr(entity, 'title', value)}", buttons=watch_channels_menu_buttons())
+        except Exception as e:
+            await send_or_edit(admin_id, event, f"خطا: {e}", buttons=watch_channels_menu_buttons())
+        PENDING_MSG.pop(admin_id, None)
+        raise events.StopPropagation
+
     if pending_key == "login_phone":
         PENDING.pop(admin_id, None)
         await start_login_phone(event, value)
@@ -621,6 +711,92 @@ async def post_to_channel(channel: dict, raw_text: str, link: str):
     await user.send_message(channel["target"], final_text, parse_mode="html", link_preview=False)
 
 
+async def notify_admins(text: str):
+    for admin_id in db.list_admins():
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+
+async def auto_post_after_watch(source_title: str, backup_link: str, source_caption: str):
+    """بعد از گرفتن لینک بکاپ برای فایلی که مانیتور پیدا کرده، خودکار پست میکنه.
+    قالب (کپشن) از همون پست مبدا گرفته میشه؛ اگه پست مبدا کپشن نداشت،
+    به «قالب پست خودکار» (تنظیم‌شده از پنل) به عنوان جایگزین برمیگرده."""
+    template = source_caption or db.get_setting("post_template")
+    if not template:
+        await notify_admins(
+            f"فایل جدید از «{source_title}» گرفته شد ولی نه کپشنی داشت نه قالب پست خودکار تنظیم شده.\n"
+            f"لینک بکاپ:\n{backup_link}"
+        )
+        return
+
+    channels = db.list_channels()
+    if not channels:
+        await notify_admins(
+            f"فایل جدید از «{source_title}» گرفته شد ولی کانال مقصدی ثبت نشده.\nلینک بکاپ:\n{backup_link}"
+        )
+        return
+
+    for channel in channels:
+        try:
+            await post_to_channel(channel, template, backup_link)
+        except Exception as e:
+            log.warning("auto post failed for %s: %s", channel["target"], e)
+            await notify_admins(
+                f"ارسال خودکار به «{channel['display'] or channel['target']}» با خطا مواجه شد: {e}\n"
+                f"لینک بکاپ:\n{backup_link}"
+            )
+
+
+async def poll_watched_channels():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    while True:
+        interval = int(db.get_setting("watch_interval_seconds") or 3600)
+        max_per_day = int(db.get_setting("watch_max_per_day") or 5)
+        try:
+            if session_connected():
+                elapsed = time.time() - db.last_download_time()
+                if elapsed >= interval and db.downloads_in_last_24h() < max_per_day:
+                    for ch in db.list_watched_channels():
+                        try:
+                            target = ch["target"]
+                            entity = await user.get_entity(int(target) if str(target).lstrip("-").isdigit() else target)
+                            msgs = await user.get_messages(entity, limit=1)
+                            if not msgs:
+                                continue
+                            latest = msgs[0]
+                            if not (latest.document or latest.file):
+                                continue
+                            fuid = latest.file.id if latest.file else str(latest.id)
+                            if db.already_downloaded(fuid):
+                                continue
+
+                            source_caption = latest.raw_text or ""
+
+                            file_path = await user.download_media(latest, file=f"{DOWNLOAD_DIR}/")
+                            db.mark_downloaded(fuid, target)
+
+                            async with session_lock:
+                                link1 = await get_link_from_bot_x(file_path)
+                                backup_link = await get_backup_link(link1)
+
+                            if file_path and os.path.exists(file_path):
+                                os.remove(file_path)
+
+                            await auto_post_after_watch(ch["title"] or str(target), backup_link, source_caption)
+                            log.info("watcher processed file from %s", ch["title"] or target)
+
+                            if db.downloads_in_last_24h() >= max_per_day:
+                                break
+                        except Exception as e:
+                            log.warning("watch error for %s: %s", ch.get("target"), e)
+        except Exception:
+            log.exception("poll_watched_channels loop error")
+
+        await asyncio.sleep(min(interval, 60) if interval > 60 else interval)
+
+
 # ---------------------------------------------------------------- file intake
 @bot.on(events.NewMessage(func=lambda e: e.file is not None and not e.message.text))
 async def file_handler(event):
@@ -673,6 +849,8 @@ async def main():
             log.warning("could not connect stored session: %s", e)
     else:
         log.warning("سشنی ثبت نشده - از /panel روی «ورود سشن جدید» بزن")
+
+    asyncio.create_task(poll_watched_channels())
 
     log.info("bot started")
     await bot.run_until_disconnected()
