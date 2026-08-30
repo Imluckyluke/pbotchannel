@@ -304,3 +304,78 @@ def last_download_time():
     row = conn.execute("SELECT MAX(downloaded_at) AS m FROM downloaded").fetchone()
     conn.close()
     return row["m"] or 0
+
+
+# ---------------------------------------------------------------- backup / restore
+def export_backup():
+    """همه‌ی تنظیمات، ادمین‌ها، کانال‌های مبدا/مقصد، و تاریخچه‌ی دانلود (برای
+    جلوگیری از پست تکراری بعد از بازیابی) رو به یه دیکشنری قابل ذخیره برمیگردونه."""
+    conn = _conn()
+    settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+    admins = [r["user_id"] for r in conn.execute("SELECT user_id FROM admins").fetchall()]
+    dest_channels = [
+        {"target": r["target"], "display": r["display"], "enabled": bool(r["enabled"])}
+        for r in conn.execute("SELECT target, display, enabled FROM dest_channels ORDER BY id").fetchall()
+    ]
+    src_channels = [
+        {"target": r["target"], "title": r["title"]}
+        for r in conn.execute("SELECT target, title FROM src_channels ORDER BY id").fetchall()
+    ]
+    downloaded = [
+        {"file_unique_id": r["file_unique_id"], "chat_id": r["chat_id"], "downloaded_at": r["downloaded_at"]}
+        for r in conn.execute(
+            "SELECT file_unique_id, chat_id, downloaded_at FROM downloaded "
+            "ORDER BY downloaded_at DESC LIMIT 2000"
+        ).fetchall()
+    ]
+    conn.close()
+    return {
+        "version": 1,
+        "settings": settings,
+        "admins": admins,
+        "dest_channels": dest_channels,
+        "src_channels": src_channels,
+        "downloaded": downloaded,
+    }
+
+
+def import_backup(data):
+    """محتوای یه بکاپ رو کامل جایگزین تنظیمات/ادمین‌ها/کانال‌های فعلی میکنه."""
+    conn = _conn()
+    cur = conn.cursor()
+
+    for k, v in (data.get("settings") or {}).items():
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (k, v),
+        )
+
+    admins = data.get("admins") or []
+    if admins:
+        cur.execute("DELETE FROM admins")
+        for uid in admins:
+            cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (int(uid),))
+
+    cur.execute("DELETE FROM dest_channels")
+    for c in data.get("dest_channels") or []:
+        cur.execute(
+            "INSERT INTO dest_channels (target, display, enabled) VALUES (?, ?, ?)",
+            (c.get("target"), c.get("display"), 1 if c.get("enabled", True) else 0),
+        )
+
+    cur.execute("DELETE FROM src_channels")
+    for c in data.get("src_channels") or []:
+        cur.execute(
+            "INSERT INTO src_channels (target, title, added_at) VALUES (?, ?, strftime('%s','now'))",
+            (str(c.get("target")), c.get("title")),
+        )
+
+    for d in data.get("downloaded") or []:
+        cur.execute(
+            "INSERT OR IGNORE INTO downloaded (file_unique_id, chat_id, downloaded_at) VALUES (?, ?, ?)",
+            (d.get("file_unique_id"), d.get("chat_id"), d.get("downloaded_at")),
+        )
+
+    conn.commit()
+    conn.close()

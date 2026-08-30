@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import json
 import time
 import logging
 
@@ -9,7 +10,7 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl, MessageMediaPhoto, MessageMediaDocument
 from telethon.errors import (
     RPCError,
     FloodWaitError,
@@ -138,6 +139,7 @@ async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
     if not parsed:
         raise RuntimeError(f"لینک دیپ‌لینک قابل تشخیص نبود (فرمت t.me/username?start=... نیست): {link}")
     bot_username, start_param = parsed
+    log.info("deeplink: در حال باز کردن گفتگو با %s (start=%s)", bot_username, start_param)
 
     async with user.conversation(bot_username, timeout=60) as conv:
         await call_with_flood_retry(
@@ -145,10 +147,21 @@ async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
             context=f"باز کردن دیپ‌لینک {bot_username}",
         )
         resp = await conv.get_response()
+        log.info(
+            "deeplink: %s -> اولین پاسخ رسید (فایل داره: %s، تعداد ردیف دکمه: %s)",
+            bot_username, bool(resp.document or resp.photo or resp.file),
+            len(resp.buttons) if resp.buttons else 0,
+        )
 
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             if resp.document or resp.photo or resp.file:
-                return await user.download_media(resp, file=f"{DOWNLOAD_DIR}/")
+                log.info("deeplink: %s -> فایل رسید، در حال دانلود (تلاش %s)", bot_username, attempt + 1)
+                return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
+
+            log.info(
+                "deeplink: %s -> تلاش %s/%s: فایل هنوز نیومده، دنبال دکمه‌های عضویت می‌گردم",
+                bot_username, attempt + 1, max_attempts,
+            )
 
             joined_any = False
             if resp.buttons:
@@ -156,8 +169,12 @@ async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
                     for btn in row:
                         url = getattr(btn, "url", None)
                         if url and "t.me/" in url:
+                            log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: %s", bot_username, url)
                             if await join_from_identifier(url):
+                                log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
                                 joined_any = True
+                            else:
+                                log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
 
             if joined_any:
                 await asyncio.sleep(2)
@@ -170,6 +187,7 @@ async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
                     for btn in row:
                         if getattr(btn, "url", None) is None:
                             try:
+                                log.info("deeplink: %s -> کلیک روی دکمه‌ی تایید عضویت", bot_username)
                                 await call_with_flood_retry(
                                     lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
                                 )
@@ -177,6 +195,7 @@ async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
                             except Exception as e:
                                 log.warning("click failed for a button in %s: %s", bot_username, e)
             if not clicked:
+                log.info("deeplink: %s -> دکمه‌ی callback نبود، دوباره /start می‌فرستم", bot_username)
                 await call_with_flood_retry(
                     lambda: conv.send_message(f"/start {start_param}"),
                     context=f"باز کردن دوباره‌ی دیپ‌لینک {bot_username}",
@@ -228,6 +247,20 @@ async def call_with_flood_retry(coro_factory, *, context: str, max_inline_wait: 
             f"⚠️ محدودیت فلود تلگرام روی «{context}»: باید {wait_s} ثانیه "
             f"(~{wait_s // 60} دقیقه) صبر کنیم. این عملیات فعلاً رد شد."
         )
+        raise
+
+
+async def safe_download_media(entity_or_message, **kwargs):
+    """دور download_media؛ اگه به باگ شناخته‌شده‌ی Telethon روی بعضی عکس‌های
+    فشرده خورد (AttributeError با کلمه‌ی location)، یه خطای خوانا میده."""
+    try:
+        return await user.download_media(entity_or_message, **kwargs)
+    except AttributeError as e:
+        if "location" in str(e):
+            raise RuntimeError(
+                "این عکس با فرمتی ذخیره شده که این نسخه از کتابخونه‌ی Telethon "
+                f"نمی‌تونه دانلودش کنه (باگ شناخته‌شده‌ی Telethon): {e}"
+            ) from e
         raise
 
 
@@ -297,6 +330,8 @@ def main_menu_buttons():
 
     # بخش ۵: مدیریت و اطلاعات
     rows.append([Button.inline(f"👤 مدیریت ادمین‌ها ({len(db.list_admins())})", data="menu:admins", style="primary")])
+    rows.append([Button.inline("📦 دریافت فایل بکاپ", data="backup:export", style="primary")])
+    rows.append([Button.inline("📥 بازیابی از فایل بکاپ", data="backup:import_start", style="primary")])
     rows.append([Button.inline("ℹ️ نمایش کامل تنظیمات", data="menu:show")])
     rows.append([Button.inline("❌ بستن", data="menu:close", style="danger")])
     return rows
@@ -431,6 +466,20 @@ async def callback_handler(event):
         paused = db.get_setting("auto_paused") == "1"
         db.set_setting("auto_paused", "0" if paused else "1")
         await event.edit("پنل تنظیمات:", buttons=main_menu_buttons())
+        return
+
+    if data == "backup:export":
+        await send_backup_file(admin_id, event)
+        return
+
+    if data == "backup:import_start":
+        PENDING[admin_id] = "restore_backup"
+        PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
+        await event.edit(
+            "فایل بکاپ (JSON) رو همینجا بفرست تا جایگزین همه‌ی تنظیمات فعلی بشه.\n"
+            "⚠️ این کار تنظیمات/کانال‌ها/ادمین‌های فعلی رو کامل جایگزین میکنه.",
+            buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
+        )
         return
 
     if data == "menu:close":
@@ -655,6 +704,14 @@ async def pending_input_handler(event):
         return  # چیزی منتظر نیست، بذار هندلرهای بعدی پردازش کنن
 
     value = event.raw_text.strip()
+
+    if pending_key == "restore_backup":
+        await send_or_edit(
+            admin_id, event,
+            "منتظر فایل بکاپم، نه متن؛ فایل JSON رو به‌عنوان فایل (نه متن) بفرست.",
+            buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
+        )
+        raise events.StopPropagation
 
     if pending_key == "add_admin":
         if not value.isdigit():
@@ -892,6 +949,64 @@ async def notify_admins(text: str):
             pass
 
 
+async def send_backup_file(admin_id: int, event):
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    path = os.path.join(DOWNLOAD_DIR, f"backup_{int(time.time())}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(db.export_backup(), f, ensure_ascii=False, indent=2)
+    try:
+        await bot.send_file(
+            admin_id, path,
+            caption=(
+                "📦 فایل بکاپ تنظیمات این ربات.\n\n"
+                "⚠️ این فایل شامل Session String هم میشه (معادل دسترسی کامل به "
+                "اکانت سشن)؛ فقط جایی نگهش‌دار که خودت بهش دسترسی داری.\n\n"
+                "برای بازیابی روی یه نصب جدید: از پنل روی «📥 بازیابی از فایل "
+                "بکاپ» بزن و همین فایل رو بفرست."
+            ),
+        )
+        await send_or_edit(admin_id, event, "فایل بکاپ فرستاده شد.", buttons=main_menu_buttons())
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+        PENDING_MSG.pop(admin_id, None)
+
+
+async def handle_restore_upload(event):
+    admin_id = event.sender_id
+    PENDING.pop(admin_id, None)
+    status = await event.reply("در حال خوندن فایل بکاپ...")
+    file_path = None
+    try:
+        file_path = await bot.download_media(event.message)
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "settings" not in data:
+            raise ValueError("این فایل فرمت فایل بکاپ همین ربات رو نداره.")
+
+        db.import_backup(data)
+
+        reconnect_note = ""
+        stored_session = db.get_setting("session_string")
+        if stored_session:
+            try:
+                await reconnect_user_client(stored_session)
+                reconnect_note = " سشن هم دوباره وصل شد."
+            except Exception as e:
+                log.warning("could not reconnect session after restore: %s", e)
+                reconnect_note = " ⚠️ سشن وصل نشد؛ از پنل دوباره لاگین کن."
+
+        await status.edit(f"✅ بازیابی انجام شد؛ همه‌ی تنظیمات/کانال‌ها/ادمین‌ها جایگزین شدن.{reconnect_note}")
+        await bot.send_message(admin_id, "پنل تنظیمات:", buttons=main_menu_buttons())
+    except Exception as e:
+        log.exception("restore failed")
+        await status.edit(f"❌ بازیابی ناموفق بود: {e}")
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        PENDING_MSG.pop(admin_id, None)
+
+
 async def auto_post_after_watch(source_title: str, final_link: str, source_caption: str):
     """بعد از گرفتن لینک نهایی برای فایلی که مانیتور پیدا کرده، خودکار پست میکنه.
     قالب (کپشن) از همون پست کانال مبدا گرفته میشه؛ اگه پست مبدا کپشن نداشت،
@@ -947,16 +1062,31 @@ async def poll_src_channels():
             if healthy and not paused:
                 elapsed = time.time() - db.last_download_time()
                 if elapsed >= interval and db.downloads_in_last_24h() < max_per_day:
+                    log.info(
+                        "watch: شروع دور بررسی کانال‌های مبدا (%s کانال، %.0f ثانیه از آخرین دانلود گذشته)",
+                        len(db.list_src_channels()), elapsed,
+                    )
                     for ch in db.list_src_channels():
                         try:
                             target = ch["target"]
+                            log.info("watch: checking source channel %s (%s)", target, ch.get("title"))
                             entity = await user.get_entity(int(target) if str(target).lstrip("-").isdigit() else target)
                             msgs = await user.get_messages(entity, limit=1)
                             if not msgs:
+                                log.info("watch: %s has no messages at all", target)
                                 continue
                             latest = msgs[0]
+                            log.info("watch: %s -> latest message id=%s", target, latest.id)
+
                             source_link = extract_source_link(latest)
-                            if not source_link and not (latest.document or latest.photo):
+                            log.info("watch: %s -> link in latest message: %s", target, source_link or "پیدا نشد")
+
+                            # latest.photo/latest.document شورتکات‌های Telethon‌ان و برای
+                            # پیش‌نمایش لینک (webpage preview) هم truthy میشن؛ اینجا فقط
+                            # مدیای واقعیِ چسبیده به پیام رو حساب میکنیم، نه تامبنیل پیش‌نمایش.
+                            has_own_media = isinstance(latest.media, (MessageMediaPhoto, MessageMediaDocument))
+                            if not source_link and not has_own_media:
+                                log.info("watch: %s -> نه لینک داشت نه فایل چسبیده، رد شد", target)
                                 continue
 
                             if source_link:
@@ -967,6 +1097,7 @@ async def poll_src_channels():
                                 dedup_key = str(media_obj.id) if media_obj else str(latest.id)
 
                             if db.already_downloaded(dedup_key):
+                                log.info("watch: %s -> این پیام قبلاً پردازش شده، رد شد", target)
                                 continue
 
                             source_caption = latest.raw_text or ""
@@ -976,13 +1107,17 @@ async def poll_src_channels():
                                     # پست کانال مبدا فایل نداره، فقط یه دیپ‌لینک به یه ربات
                                     # (مثل خودمون) داره؛ باید واردش بشیم، اگه گیت عضویت
                                     # داشت عضو کانال‌هاش بشیم، و فایل رو ازش بگیریم.
+                                    log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
                                     file_path = await fetch_file_from_start_link(source_link)
+                                    log.info("watch: %s -> فایل از دیپ‌لینک گرفته شد: %s", target, file_path)
                                 else:
-                                    file_path = await user.download_media(latest, file=f"{DOWNLOAD_DIR}/")
+                                    log.info("watch: %s -> دانلود مستقیم فایل چسبیده به پست", target)
+                                    file_path = await safe_download_media(latest, file=f"{DOWNLOAD_DIR}/")
+                                    log.info("watch: %s -> دانلود مستقیم موفق: %s", target, file_path)
                             except Exception as e:
                                 # جلوی تلاش بی‌نهایتِ همین پیام رو می‌گیریم و به ادمین خبر میدیم
                                 db.mark_downloaded(dedup_key, target)
-                                log.warning("could not fetch file for %s: %s", target, e)
+                                log.warning("watch: %s -> نتونست فایل رو بگیره: %s", target, e, exc_info=True)
                                 await notify_admins(
                                     f"⚠️ نتونستم فایل رو از پستِ «{ch['title'] or target}» بگیرم.\n"
                                     f"لینک: {source_link or '(فایل مستقیم روی خود پست)'}\nخطا: {e}"
@@ -992,19 +1127,24 @@ async def poll_src_channels():
                             db.mark_downloaded(dedup_key, target)
 
                             async with session_lock:
+                                log.info("watch: %s -> در حال ارسال فایل به ربات اول", target)
                                 link1 = await get_link_from_bot1(file_path)
+                                log.info("watch: %s -> لینک ربات اول گرفته شد: %s", target, link1)
+                                log.info("watch: %s -> در حال ارسال لینک به ربات دوم", target)
                                 final_link = await get_link_from_bot2(link1)
+                                log.info("watch: %s -> لینک نهایی ربات دوم: %s", target, final_link)
 
                             if file_path and os.path.exists(file_path):
                                 os.remove(file_path)
 
+                            log.info("watch: %s -> در حال پست به کانال‌های مقصد فعال", target)
                             await auto_post_after_watch(ch["title"] or str(target), final_link, source_caption)
-                            log.info("watcher processed file from %s", ch["title"] or target)
+                            log.info("watch: %s -> پست کامل انجام شد ✅", target)
 
                             if db.downloads_in_last_24h() >= max_per_day:
                                 break
                         except Exception as e:
-                            log.warning("watch error for %s: %s", ch.get("target"), e)
+                            log.warning("watch error for %s: %s", ch.get("target"), e, exc_info=True)
         except Exception:
             log.exception("poll_src_channels loop error")
 
@@ -1012,9 +1152,14 @@ async def poll_src_channels():
 
 
 # ---------------------------------------------------------------- file intake
-@bot.on(events.NewMessage(func=lambda e: e.file is not None and not e.message.text))
+@bot.on(events.NewMessage(func=lambda e: e.file is not None))
 async def file_handler(event):
     if not is_admin(event.sender_id):
+        return
+    if PENDING.get(event.sender_id) == "restore_backup":
+        await handle_restore_upload(event)
+        raise events.StopPropagation
+    if event.message.text:
         return
     await process_file(event)
 
