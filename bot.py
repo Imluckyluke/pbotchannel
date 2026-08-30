@@ -87,7 +87,8 @@ def main_menu_buttons():
     for key, label in SETTINGS_LABELS.items():
         rows.append([Button.inline(label, data=f"set:{key}")])
     status = "متصل ✅" if session_connected() else "قطع ❌"
-    rows.append([Button.inline(f"🔑 ورود سشن جدید (وضعیت: {status})", data="login:start")])
+    rows.append([Button.inline(f"🔑 ورود با شماره (وضعیت: {status})", data="login:start")])
+    rows.append([Button.inline("📋 ورود مستقیم با Session String", data="login:string")])
     rows.append([Button.inline("مدیریت ادمین‌ها", data="menu:admins")])
     rows.append([Button.inline("نمایش کامل تنظیمات", data="menu:show")])
     rows.append([Button.inline("بستن", data="menu:close")])
@@ -172,11 +173,11 @@ async def finish_login(edit_target, admin_id: int):
     await temp_client.disconnect()
     await reconnect_user_client(session_string)
 
-    text = "ورود موفق بود، سشن ذخیره و وصل شد."
-    if hasattr(edit_target, "edit"):
-        await edit_target.edit(text, buttons=main_menu_buttons())
+    text = f"ورود موفق بود، سشن ذخیره و وصل شد.\n\nSession String:\n`{session_string}`"
+    if isinstance(edit_target, events.CallbackQuery.Event):
+        await edit_target.edit(text, buttons=main_menu_buttons(), parse_mode="markdown")
     else:
-        await edit_target.respond(text, buttons=main_menu_buttons())
+        await edit_target.respond(text, buttons=main_menu_buttons(), parse_mode="markdown")
 
 
 @bot.on(events.CallbackQuery())
@@ -248,6 +249,15 @@ async def callback_handler(event):
             PENDING[admin_id] = "login_phone"
             await event.edit(
                 "شماره تلفن اکانت سشن رو با فرمت بین‌المللی بفرست (مثلا +989123456789):",
+                buttons=[[Button.inline("انصراف", data="menu:main")]],
+            )
+            return
+
+        if action == "string":
+            LOGIN_SESSIONS.pop(admin_id, None)
+            PENDING[admin_id] = "login_session_string"
+            await event.edit(
+                "استرینگ سشن (Session String) رو بفرست:",
                 buttons=[[Button.inline("انصراف", data="menu:main")]],
             )
             return
@@ -347,6 +357,23 @@ async def pending_input_handler(event):
         await start_login_phone(event, value)
         raise events.StopPropagation
 
+    if pending_key == "login_session_string":
+        PENDING.pop(admin_id, None)
+        try:
+            await reconnect_user_client(value)
+        except Exception as e:
+            await event.reply(
+                f"استرینگ نامعتبر بود یا وصل نشد:\n{e}", buttons=main_menu_buttons()
+            )
+            raise events.StopPropagation
+        db.set_setting("session_string", value)
+        await event.reply(
+            f"وصل شد و ذخیره شد.\n\nSession String:\n`{value}`",
+            buttons=main_menu_buttons(),
+            parse_mode="markdown",
+        )
+        raise events.StopPropagation
+
     if pending_key == "login_password":
         sess = LOGIN_SESSIONS.get(admin_id)
         try:
@@ -394,7 +421,7 @@ async def get_link_from_bot_x(file_path: str) -> str:
         raise RuntimeError("اول از پنل، ربات X رو تنظیم کن")
 
     async with user.conversation(bot_x, timeout=180) as conv:
-        await user.send_file(bot_x, file_path)
+        await conv.send_file(file_path)
         resp = await conv.get_response()
         return extract_link(resp.raw_text)
 
