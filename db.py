@@ -8,13 +8,14 @@ DB_PATH = os.environ.get(
 )
 
 DEFAULTS = {
-    "bot_x_username": "",
-    "backup_bot_username": "",
-    "trigger_word": "مشاهده",   # کلمه‌ای که توی پیام تبدیل به لینک بکاپ میشه
-    "session_string": "",       # با پنل داخل ربات (🔑 ورود سشن جدید) پر میشه
-    "watch_interval_seconds": "3600",  # حداقل فاصله بین دو دور دانلود از چنل‌های مانیتور
-    "watch_max_per_day": "5",          # حداکثر تعداد فایل در ۲۴ ساعت از چنل‌های مانیتور
-    "post_template": "",               # قالب پیام برای پست خودکار (شامل «ایدی چنل» و کلمه‌ی تریگر)
+    "bot1_username": "",        # ربات اول (قبلا: ربات X)
+    "bot2_username": "",        # ربات دوم (قبلا: ربات بکاپ)
+    "trigger_word": "مشاهده",   # کلمه‌ای که توی پیام تبدیل به لینک نهایی میشه
+    "session_string": "",       # با پنل داخل ربات لاگین سشن پر میشه
+    "watch_interval_minutes": "60",    # فاصله زمانی بین هر پست (دقیقه)
+    "watch_max_per_day": "5",          # تعداد پست روزانه
+    "post_template": "",               # قالب جایگزین وقتی پست کانال مبدا کپشن نداره
+    "auto_paused": "0",                # توقف کلی ارسال/مانیتور خودکار (۱ یعنی متوقفه)
 }
 
 
@@ -37,13 +38,18 @@ def init_db(bootstrap_admin_ids=None):
         "CREATE TABLE IF NOT EXISTS last_link (user_id INTEGER PRIMARY KEY, link TEXT)"
     )
     cur.execute(
-        "CREATE TABLE IF NOT EXISTS channels ("
+        "CREATE TABLE IF NOT EXISTS dest_channels ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "target TEXT NOT NULL, "
-        "display TEXT)"
+        "display TEXT, "
+        "enabled INTEGER NOT NULL DEFAULT 1)"
     )
+    # مهاجرت برای دیتابیس‌های قدیمی که ستون enabled رو ندارن
+    existing_cols = [r["name"] for r in cur.execute("PRAGMA table_info(dest_channels)").fetchall()]
+    if "enabled" not in existing_cols:
+        cur.execute("ALTER TABLE dest_channels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
     cur.execute(
-        "CREATE TABLE IF NOT EXISTS watched_channels ("
+        "CREATE TABLE IF NOT EXISTS src_channels ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "target TEXT NOT NULL, "
         "title TEXT, "
@@ -63,6 +69,23 @@ def init_db(bootstrap_admin_ids=None):
         )
     conn.commit()
 
+    # مهاجرت از تنظیم قدیمی «فاصله بررسی به ثانیه» به تنظیم جدید «فاصله بین پست‌ها به دقیقه»
+    old_row = cur.execute(
+        "SELECT value FROM settings WHERE key = 'watch_interval_seconds'"
+    ).fetchone()
+    if old_row is not None:
+        try:
+            old_seconds = int(old_row["value"])
+            new_minutes = max(1, round(old_seconds / 60))
+        except (TypeError, ValueError):
+            new_minutes = 60
+        cur.execute(
+            "UPDATE settings SET value = ? WHERE key = 'watch_interval_minutes'",
+            (str(new_minutes),),
+        )
+        cur.execute("DELETE FROM settings WHERE key = 'watch_interval_seconds'")
+        conn.commit()
+
     if bootstrap_admin_ids:
         for uid in bootstrap_admin_ids:
             cur.execute(
@@ -72,6 +95,7 @@ def init_db(bootstrap_admin_ids=None):
     conn.close()
 
 
+# ---------------------------------------------------------------- settings
 def get_setting(key):
     conn = _conn()
     row = conn.execute(
@@ -99,6 +123,7 @@ def set_setting(key, value):
     conn.close()
 
 
+# ---------------------------------------------------------------- admins
 def is_admin(user_id):
     conn = _conn()
     row = conn.execute(
@@ -129,6 +154,7 @@ def list_admins():
     return [r["user_id"] for r in rows]
 
 
+# ---------------------------------------------------------------- last link (per chat)
 def set_last_link(user_id, link):
     conn = _conn()
     conn.execute(
@@ -149,10 +175,20 @@ def get_last_link(user_id):
     return row["link"] if row else None
 
 
-def add_channel(target, display):
+# ---------------------------------------------------------------- destination channels (post targets)
+def _dest_row(r):
+    return {
+        "id": r["id"],
+        "target": r["target"],
+        "display": r["display"],
+        "enabled": bool(r["enabled"]),
+    }
+
+
+def add_dest_channel(target, display):
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO channels (target, display) VALUES (?, ?)", (target, display)
+        "INSERT INTO dest_channels (target, display, enabled) VALUES (?, ?, 1)", (target, display)
     )
     conn.commit()
     channel_id = cur.lastrowid
@@ -160,34 +196,57 @@ def add_channel(target, display):
     return channel_id
 
 
-def list_channels():
+def list_dest_channels():
     conn = _conn()
-    rows = conn.execute("SELECT id, target, display FROM channels ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id, target, display, enabled FROM dest_channels ORDER BY id").fetchall()
     conn.close()
-    return [{"id": r["id"], "target": r["target"], "display": r["display"]} for r in rows]
+    return [_dest_row(r) for r in rows]
 
 
-def get_channel(channel_id):
+def list_enabled_dest_channels():
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT id, target, display, enabled FROM dest_channels WHERE enabled = 1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [_dest_row(r) for r in rows]
+
+
+def get_dest_channel(channel_id):
     conn = _conn()
     row = conn.execute(
-        "SELECT id, target, display FROM channels WHERE id = ?", (channel_id,)
+        "SELECT id, target, display, enabled FROM dest_channels WHERE id = ?", (channel_id,)
     ).fetchone()
     conn.close()
-    return {"id": row["id"], "target": row["target"], "display": row["display"]} if row else None
+    return _dest_row(row) if row else None
 
 
-def remove_channel(channel_id):
+def remove_dest_channel(channel_id):
     conn = _conn()
-    conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+    conn.execute("DELETE FROM dest_channels WHERE id = ?", (channel_id,))
     conn.commit()
     conn.close()
 
 
-# ---------------------------------------------------------------- watched channels (source)
-def add_watched_channel(target, title):
+def toggle_dest_channel(channel_id):
+    """فعال/غیرفعال کردن ارسال برای یه کانال مقصد؛ وضعیت جدید رو برمیگردونه."""
+    conn = _conn()
+    row = conn.execute("SELECT enabled FROM dest_channels WHERE id = ?", (channel_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    new_val = 0 if row["enabled"] else 1
+    conn.execute("UPDATE dest_channels SET enabled = ? WHERE id = ?", (new_val, channel_id))
+    conn.commit()
+    conn.close()
+    return bool(new_val)
+
+
+# ---------------------------------------------------------------- source channels (monitored)
+def add_src_channel(target, title):
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO watched_channels (target, title, added_at) VALUES (?, ?, strftime('%s','now'))",
+        "INSERT INTO src_channels (target, title, added_at) VALUES (?, ?, strftime('%s','now'))",
         (str(target), title),
     )
     conn.commit()
@@ -196,16 +255,16 @@ def add_watched_channel(target, title):
     return channel_id
 
 
-def list_watched_channels():
+def list_src_channels():
     conn = _conn()
-    rows = conn.execute("SELECT id, target, title FROM watched_channels ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id, target, title FROM src_channels ORDER BY id").fetchall()
     conn.close()
     return [{"id": r["id"], "target": r["target"], "title": r["title"]} for r in rows]
 
 
-def remove_watched_channel(channel_id):
+def remove_src_channel(channel_id):
     conn = _conn()
-    conn.execute("DELETE FROM watched_channels WHERE id = ?", (channel_id,))
+    conn.execute("DELETE FROM src_channels WHERE id = ?", (channel_id,))
     conn.commit()
     conn.close()
 
