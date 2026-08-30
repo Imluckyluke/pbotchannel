@@ -10,8 +10,7 @@ DB_PATH = os.environ.get(
 DEFAULTS = {
     "bot_x_username": "",
     "backup_bot_username": "",
-    "channel_target": "",       # چت آیدی/یوزرنیم مقصد ارسال پست (باید ربات ادمین کانال باشه)
-    "channel_display": "",      # متنی که به جای "ایدی چنل" داخل پیام قرار میگیره
+    "trigger_word": "مشاهده",   # کلمه‌ای که توی پیام تبدیل به لینک بکاپ میشه
     "session_string": "",       # با پنل داخل ربات (🔑 ورود سشن جدید) پر میشه
 }
 
@@ -33,6 +32,12 @@ def init_db(bootstrap_admin_ids=None):
     )
     cur.execute(
         "CREATE TABLE IF NOT EXISTS last_link (user_id INTEGER PRIMARY KEY, link TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS channels ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "target TEXT NOT NULL, "
+        "display TEXT)"
     )
     conn.commit()
 
@@ -126,3 +131,37 @@ def get_last_link(user_id):
     ).fetchone()
     conn.close()
     return row["link"] if row else None
+
+
+def add_channel(target, display):
+    conn = _conn()
+    cur = conn.execute(
+        "INSERT INTO channels (target, display) VALUES (?, ?)", (target, display)
+    )
+    conn.commit()
+    channel_id = cur.lastrowid
+    conn.close()
+    return channel_id
+
+
+def list_channels():
+    conn = _conn()
+    rows = conn.execute("SELECT id, target, display FROM channels ORDER BY id").fetchall()
+    conn.close()
+    return [{"id": r["id"], "target": r["target"], "display": r["display"]} for r in rows]
+
+
+def get_channel(channel_id):
+    conn = _conn()
+    row = conn.execute(
+        "SELECT id, target, display FROM channels WHERE id = ?", (channel_id,)
+    ).fetchone()
+    conn.close()
+    return {"id": row["id"], "target": row["target"], "display": row["display"]} if row else None
+
+
+def remove_channel(channel_id):
+    conn = _conn()
+    conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+    conn.commit()
+    conn.close()

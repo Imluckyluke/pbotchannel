@@ -44,14 +44,28 @@ LOGIN_SESSIONS = {}    # user_id -> {client, phone, phone_code_hash, code}
 SETTINGS_LABELS = {
     "bot_x_username": "ربات X",
     "backup_bot_username": "ربات بکاپ",
-    "channel_target": "چنل مقصد (پست)",
-    "channel_display": "نمایش آیدی چنل",
+    "trigger_word": "کلمه‌ی تبدیل به لینک",
 }
+
+PENDING_TEMPLATE = {}   # user_id -> {"text": ..., "link": ...} تا وقتی کانال انتخاب بشه
+TEMP_CHANNEL = {}       # user_id -> target موقت هنگام افزودن کانال جدید
+PENDING_MSG = {}        # user_id -> (chat_id, message_id) پیام پنلی که باید ادیت بشه
 
 
 # ---------------------------------------------------------------- helpers
 def is_admin(user_id: int) -> bool:
     return db.is_admin(user_id)
+
+
+async def send_or_edit(admin_id: int, event, text: str, buttons=None, parse_mode=None):
+    """اگه پیام پنلی قبلی داریم همونو ادیت میکنه، وگرنه پیام جدید میفرسته."""
+    loc = PENDING_MSG.get(admin_id)
+    if loc:
+        try:
+            return await bot.edit_message(loc[0], loc[1], text, buttons=buttons, parse_mode=parse_mode)
+        except Exception:
+            pass
+    return await event.reply(text, buttons=buttons, parse_mode=parse_mode)
 
 
 def extract_link(text: str) -> str:
@@ -85,21 +99,43 @@ def session_connected() -> bool:
 def main_menu_buttons():
     rows = []
     for key, label in SETTINGS_LABELS.items():
-        rows.append([Button.inline(label, data=f"set:{key}")])
-    status = "متصل ✅" if session_connected() else "قطع ❌"
-    rows.append([Button.inline(f"🔑 ورود با شماره (وضعیت: {status})", data="login:start")])
-    rows.append([Button.inline("📋 ورود مستقیم با Session String", data="login:string")])
-    rows.append([Button.inline("مدیریت ادمین‌ها", data="menu:admins")])
+        current = db.get_setting(key)
+        val = current if current else "تنظیم‌نشده"
+        style = "success" if current else "danger"
+        rows.append([Button.inline(f"{label}: {val}", data=f"set:{key}", style=style)])
+    connected = session_connected()
+    status = "متصل" if connected else "قطع"
+    rows.append([Button.inline(f"ورود با شماره ({status})", data="login:start", style="success" if connected else "danger")])
+    rows.append([Button.inline("ورود مستقیم با Session String", data="login:string", style="primary")])
+    rows.append([Button.inline(f"مدیریت کانال‌ها ({len(db.list_channels())})", data="menu:channels", style="primary")])
+    rows.append([Button.inline(f"مدیریت ادمین‌ها ({len(db.list_admins())})", data="menu:admins", style="primary")])
     rows.append([Button.inline("نمایش کامل تنظیمات", data="menu:show")])
-    rows.append([Button.inline("بستن", data="menu:close")])
+    rows.append([Button.inline("بستن", data="menu:close", style="danger")])
     return rows
 
 
 def admins_menu_buttons():
-    rows = [[Button.inline(f"❌ حذف {a}", data=f"admin:rm:{a}")] for a in db.list_admins()]
-    rows.append([Button.inline("➕ افزودن ادمین", data="admin:add")])
+    rows = [[Button.inline(f"حذف {a}", data=f"admin:rm:{a}", style="danger")] for a in db.list_admins()]
+    rows.append([Button.inline("افزودن ادمین", data="admin:add", style="success")])
     rows.append([Button.inline("بازگشت", data="menu:main")])
     return rows
+
+
+def channels_menu_buttons():
+    rows = [
+        [Button.inline(f"حذف {c['display'] or c['target']}", data=f"channel:rm:{c['id']}", style="danger")]
+        for c in db.list_channels()
+    ]
+    rows.append([Button.inline("افزودن کانال", data="channel:add", style="success")])
+    rows.append([Button.inline("بازگشت", data="menu:main")])
+    return rows
+
+
+def channel_pick_buttons():
+    return [
+        [Button.inline(c["display"] or c["target"], data=f"post:{c['id']}", style="primary")]
+        for c in db.list_channels()
+    ]
 
 
 def code_keypad(code_so_far: str):
@@ -111,10 +147,10 @@ def code_keypad(code_so_far: str):
             row = []
     rows.append([
         Button.inline("0", data="login:digit:0"),
-        Button.inline("⌫", data="login:back"),
-        Button.inline("✅ تایید", data="login:submit"),
+        Button.inline("پاک کردن", data="login:back", style="danger"),
+        Button.inline("تایید", data="login:submit", style="success"),
     ])
-    rows.append([Button.inline("❌ انصراف", data="login:cancel")])
+    rows.append([Button.inline("انصراف", data="login:cancel", style="danger")])
     return rows
 
 
@@ -148,7 +184,8 @@ async def start_login_phone(event, phone: str):
         await temp_client.connect()
         sent = await temp_client.send_code_request(phone)
     except Exception as e:
-        await event.respond(f"خطا در ارسال کد: {e}", buttons=main_menu_buttons())
+        await send_or_edit(admin_id, event, f"خطا در ارسال کد: {e}", buttons=main_menu_buttons())
+        PENDING_MSG.pop(admin_id, None)
         return
 
     LOGIN_SESSIONS[admin_id] = {
@@ -157,7 +194,8 @@ async def start_login_phone(event, phone: str):
         "phone_code_hash": sent.phone_code_hash,
         "code": "",
     }
-    await event.respond(
+    await send_or_edit(
+        admin_id, event,
         f"کد به {phone} ارسال شد.\nکد وارد شده: —\n\nبا دکمه‌های زیر وارد کن:",
         buttons=code_keypad(""),
     )
@@ -174,10 +212,8 @@ async def finish_login(edit_target, admin_id: int):
     await reconnect_user_client(session_string)
 
     text = f"ورود موفق بود، سشن ذخیره و وصل شد.\n\nSession String:\n`{session_string}`"
-    if isinstance(edit_target, events.CallbackQuery.Event):
-        await edit_target.edit(text, buttons=main_menu_buttons(), parse_mode="markdown")
-    else:
-        await edit_target.respond(text, buttons=main_menu_buttons(), parse_mode="markdown")
+    await send_or_edit(admin_id, edit_target, text, buttons=main_menu_buttons(), parse_mode="markdown")
+    PENDING_MSG.pop(admin_id, None)
 
 
 @bot.on(events.CallbackQuery())
@@ -191,11 +227,13 @@ async def callback_handler(event):
 
     if data == "menu:main":
         PENDING.pop(admin_id, None)
+        PENDING_MSG.pop(admin_id, None)
         await event.edit("پنل تنظیمات:", buttons=main_menu_buttons())
         return
 
     if data == "menu:close":
         PENDING.pop(admin_id, None)
+        PENDING_MSG.pop(admin_id, None)
         await event.edit("بسته شد. برای باز کردن دوباره /panel رو بزن.")
         return
 
@@ -206,13 +244,57 @@ async def callback_handler(event):
             if k == "session_string":
                 continue
             lines.append(f"{SETTINGS_LABELS.get(k, k)}: {v or '—'}")
-        lines.append(f"وضعیت سشن: {'متصل ✅' if session_connected() else 'قطع ❌'}")
+        lines.append(f"وضعیت سشن: {'متصل' if session_connected() else 'قطع'}")
         lines.append(f"ادمین‌ها: {db.list_admins()}")
+        chans = db.list_channels()
+        if chans:
+            lines.append("کانال‌ها: " + ", ".join(c["display"] or c["target"] for c in chans))
+        else:
+            lines.append("کانال‌ها: —")
         await event.edit("\n".join(lines), buttons=[[Button.inline("بازگشت", data="menu:main")]])
+        return
+
+    if data == "menu:channels":
+        PENDING.pop(admin_id, None)
+        PENDING_MSG.pop(admin_id, None)
+        await event.edit("مدیریت کانال‌ها:", buttons=channels_menu_buttons())
+        return
+
+    if data == "channel:add":
+        PENDING[admin_id] = "add_channel_target"
+        PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
+        await event.edit(
+            "آیدی عددی یا یوزرنیم کانال (مثلا @mychannel) رو بفرست:",
+            buttons=[[Button.inline("انصراف", data="menu:channels", style="danger")]],
+        )
+        return
+
+    if data.startswith("channel:rm:"):
+        cid = int(data.split(":")[2])
+        db.remove_channel(cid)
+        await event.edit("کانال حذف شد.\n\nمدیریت کانال‌ها:", buttons=channels_menu_buttons())
+        return
+
+    if data.startswith("post:"):
+        cid = int(data.split(":", 1)[1])
+        pending = PENDING_TEMPLATE.pop(admin_id, None)
+        if not pending:
+            await event.answer("این درخواست منقضی شده، دوباره پیام رو بفرست.", alert=True)
+            return
+        channel = db.get_channel(cid)
+        if not channel:
+            await event.answer("این کانال دیگه وجود نداره.", alert=True)
+            return
+        try:
+            await post_to_channel(channel, pending["text"], pending["link"])
+            await event.edit(f"پست شد توی «{channel['display'] or channel['target']}».")
+        except Exception as e:
+            await event.edit(f"ارسال به کانال با خطا مواجه شد: {e}")
         return
 
     if data == "menu:admins":
         PENDING.pop(admin_id, None)
+        PENDING_MSG.pop(admin_id, None)
         await event.edit("مدیریت ادمین‌ها:", buttons=admins_menu_buttons())
         return
 
@@ -224,20 +306,22 @@ async def callback_handler(event):
 
     if data == "admin:add":
         PENDING[admin_id] = "add_admin"
+        PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
         await event.edit(
             "آیدی عددی ادمین جدید رو بفرست:",
-            buttons=[[Button.inline("انصراف", data="menu:admins")]],
+            buttons=[[Button.inline("انصراف", data="menu:admins", style="danger")]],
         )
         return
 
     if data.startswith("set:"):
         key = data.split(":", 1)[1]
         PENDING[admin_id] = key
+        PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
         current = db.get_setting(key)
         label = SETTINGS_LABELS.get(key, key)
         await event.edit(
             f"{label}\nمقدار فعلی: {current or '—'}\n\nمقدار جدید رو بفرست:",
-            buttons=[[Button.inline("انصراف", data="menu:main")]],
+            buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
         )
         return
 
@@ -247,23 +331,26 @@ async def callback_handler(event):
         if action == "start":
             LOGIN_SESSIONS.pop(admin_id, None)
             PENDING[admin_id] = "login_phone"
+            PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
             await event.edit(
                 "شماره تلفن اکانت سشن رو با فرمت بین‌المللی بفرست (مثلا +989123456789):",
-                buttons=[[Button.inline("انصراف", data="menu:main")]],
+                buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
             )
             return
 
         if action == "string":
             LOGIN_SESSIONS.pop(admin_id, None)
             PENDING[admin_id] = "login_session_string"
+            PENDING_MSG[admin_id] = (event.chat_id, event.message_id)
             await event.edit(
                 "استرینگ سشن (Session String) رو بفرست:",
-                buttons=[[Button.inline("انصراف", data="menu:main")]],
+                buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
             )
             return
 
         if action == "cancel":
             PENDING.pop(admin_id, None)
+            PENDING_MSG.pop(admin_id, None)
             sess = LOGIN_SESSIONS.pop(admin_id, None)
             if sess:
                 try:
@@ -308,7 +395,7 @@ async def callback_handler(event):
                 await event.edit(
                     "این اکانت تایید دو مرحله‌ای داره.\n"
                     "رمز (2FA) رو به صورت پیام متنی بفرست (بعد از خوندنش پیامت پاک میشه):",
-                    buttons=[[Button.inline("انصراف", data="login:cancel")]],
+                    buttons=[[Button.inline("انصراف", data="login:cancel", style="danger")]],
                 )
                 return
             except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
@@ -345,11 +432,39 @@ async def pending_input_handler(event):
 
     if pending_key == "add_admin":
         if not value.isdigit():
-            await event.reply("باید فقط آیدی عددی بفرستی.")
+            await send_or_edit(
+                admin_id, event, "باید فقط آیدی عددی بفرستی.",
+                buttons=[[Button.inline("انصراف", data="menu:admins", style="danger")]],
+            )
             raise events.StopPropagation
         db.add_admin(int(value))
         PENDING.pop(admin_id, None)
-        await event.reply(f"ادمین {value} اضافه شد.", buttons=main_menu_buttons())
+        await send_or_edit(admin_id, event, f"ادمین {value} اضافه شد.", buttons=main_menu_buttons())
+        PENDING_MSG.pop(admin_id, None)
+        raise events.StopPropagation
+
+    if pending_key == "add_channel_target":
+        TEMP_CHANNEL[admin_id] = value
+        PENDING[admin_id] = "add_channel_display"
+        await send_or_edit(
+            admin_id, event,
+            "حالا متنی که به جای «ایدی چنل» توی پیام جایگزین بشه رو بفرست\n"
+            "(اگه لازم نداری، فقط یه خط تیره - بفرست):",
+            buttons=[[Button.inline("انصراف", data="menu:channels", style="danger")]],
+        )
+        raise events.StopPropagation
+
+    if pending_key == "add_channel_display":
+        target = TEMP_CHANNEL.pop(admin_id, None)
+        PENDING.pop(admin_id, None)
+        if not target:
+            await send_or_edit(admin_id, event, "چیزی برای افزودن پیدا نشد، دوباره از پنل شروع کن.", buttons=main_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
+            raise events.StopPropagation
+        display = "" if value == "-" else value
+        db.add_channel(target, display)
+        await send_or_edit(admin_id, event, f"کانال «{display or target}» اضافه شد.", buttons=channels_menu_buttons())
+        PENDING_MSG.pop(admin_id, None)
         raise events.StopPropagation
 
     if pending_key == "login_phone":
@@ -362,16 +477,17 @@ async def pending_input_handler(event):
         try:
             await reconnect_user_client(value)
         except Exception as e:
-            await event.reply(
-                f"استرینگ نامعتبر بود یا وصل نشد:\n{e}", buttons=main_menu_buttons()
-            )
+            await send_or_edit(admin_id, event, f"استرینگ نامعتبر بود یا وصل نشد:\n{e}", buttons=main_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
             raise events.StopPropagation
         db.set_setting("session_string", value)
-        await event.reply(
+        await send_or_edit(
+            admin_id, event,
             f"وصل شد و ذخیره شد.\n\nSession String:\n`{value}`",
             buttons=main_menu_buttons(),
             parse_mode="markdown",
         )
+        PENDING_MSG.pop(admin_id, None)
         raise events.StopPropagation
 
     if pending_key == "login_password":
@@ -382,12 +498,16 @@ async def pending_input_handler(event):
             pass
         if not sess:
             PENDING.pop(admin_id, None)
-            await event.respond("جلسه‌ی ورود پیدا نشد، دوباره از پنل شروع کن.", buttons=main_menu_buttons())
+            await send_or_edit(admin_id, event, "جلسه‌ی ورود پیدا نشد، دوباره از پنل شروع کن.", buttons=main_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
             raise events.StopPropagation
         try:
             await sess["client"].sign_in(password=value)
         except PasswordHashInvalidError:
-            await event.respond("رمز اشتباهه، دوباره بفرست:", buttons=[[Button.inline("انصراف", data="login:cancel")]])
+            await send_or_edit(
+                admin_id, event, "رمز اشتباهه، دوباره بفرست:",
+                buttons=[[Button.inline("انصراف", data="login:cancel", style="danger")]],
+            )
             raise events.StopPropagation
         except Exception as e:
             PENDING.pop(admin_id, None)
@@ -396,7 +516,8 @@ async def pending_input_handler(event):
                 await sess["client"].disconnect()
             except Exception:
                 pass
-            await event.respond(f"خطا: {e}", buttons=main_menu_buttons())
+            await send_or_edit(admin_id, event, f"خطا: {e}", buttons=main_menu_buttons())
+            PENDING_MSG.pop(admin_id, None)
             raise events.StopPropagation
 
         PENDING.pop(admin_id, None)
@@ -407,7 +528,8 @@ async def pending_input_handler(event):
     db.set_setting(pending_key, value)
     PENDING.pop(admin_id, None)
     label = SETTINGS_LABELS.get(pending_key, pending_key)
-    await event.reply(f"{label} تنظیم شد روی:\n{value}", buttons=main_menu_buttons())
+    await send_or_edit(admin_id, event, f"{label} تنظیم شد روی:\n{value}", buttons=main_menu_buttons())
+    PENDING_MSG.pop(admin_id, None)
     raise events.StopPropagation
 
 
@@ -471,7 +593,11 @@ async def process_file(event):
             backup_link = await get_backup_link(link1)
 
         db.set_last_link(event.sender_id, backup_link)
-        await status.edit(f"لینک بکاپ:\n{backup_link}")
+        trigger_word = db.get_setting("trigger_word") or "مشاهده"
+        await status.edit(
+            f"لینک بکاپ:\n{backup_link}\n\n"
+            f"حالا کپشن رو بفرست (باید کلمه‌ی «{trigger_word}» توش باشه تا پست بشه)."
+        )
     except Exception as e:
         log.exception("process_file failed")
         await status.edit(f"خطا: {e}")
@@ -480,10 +606,19 @@ async def process_file(event):
             os.remove(file_path)
 
 
-def build_channel_message(raw_text: str, link: str, channel_display: str) -> str:
+def build_channel_message(raw_text: str, link: str, channel_display: str, trigger_word: str) -> str:
     text = raw_text.replace("ایدی چنل", channel_display or "")
-    text = text.replace("مشاهده", f'<a href="{link}">مشاهده</a>')
+    text = text.replace(trigger_word, f'<a href="{link}">{trigger_word}</a>')
     return text
+
+
+async def post_to_channel(channel: dict, raw_text: str, link: str):
+    """پست کردن توی کانال با اکانت سشن (یوزربات)، نه ربات."""
+    if not session_connected():
+        raise RuntimeError("سشن وصل نیست؛ از پنل روی «ورود با شماره» یا «Session String» بزن")
+    trigger_word = db.get_setting("trigger_word") or "مشاهده"
+    final_text = build_channel_message(raw_text, link, channel["display"], trigger_word)
+    await user.send_message(channel["target"], final_text, parse_mode="html", link_preview=False)
 
 
 # ---------------------------------------------------------------- file intake
@@ -499,7 +634,8 @@ async def file_handler(event):
 async def template_handler(event):
     if not is_admin(event.sender_id):
         return
-    if "مشاهده" not in event.text:
+    trigger_word = db.get_setting("trigger_word") or "مشاهده"
+    if trigger_word not in event.text:
         return
 
     link = db.get_last_link(event.sender_id)
@@ -507,19 +643,21 @@ async def template_handler(event):
         await event.reply("هنوز لینک بکاپی برای این چت ثبت نشده؛ اول یه فایل بفرست.")
         return
 
-    channel_target = db.get_setting("channel_target")
-    channel_display = db.get_setting("channel_display")
-    if not channel_target:
-        await event.reply("اول از پنل، چنل مقصد رو تنظیم کن.")
+    channels = db.list_channels()
+    if not channels:
+        await event.reply("هنوز کانالی اضافه نشده؛ از پنل روی «مدیریت کانال‌ها» بزن.")
         return
 
-    final_text = build_channel_message(event.text, link, channel_display)
+    if len(channels) == 1:
+        try:
+            await post_to_channel(channels[0], event.text, link)
+            await event.reply("پست شد توی کانال.")
+        except (RPCError, RuntimeError) as e:
+            await event.reply(f"ارسال به کانال با خطا مواجه شد: {e}")
+        return
 
-    try:
-        await bot.send_message(channel_target, final_text, parse_mode="html", link_preview=False)
-        await event.reply("پست شد توی چنل.")
-    except RPCError as e:
-        await event.reply(f"ارسال به چنل با خطا مواجه شد: {e}")
+    PENDING_TEMPLATE[event.sender_id] = {"text": event.text, "link": link}
+    await event.reply("به کدوم کانال ارسال بشه؟", buttons=channel_pick_buttons())
 
 
 # ---------------------------------------------------------------- run
