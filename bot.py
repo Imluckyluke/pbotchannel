@@ -9,6 +9,7 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 from telethon.errors import (
     RPCError,
     FloodWaitError,
@@ -37,6 +38,7 @@ log = logging.getLogger("relay-bot")
 
 LINK_RE = re.compile(r"https?://\S+")
 INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_]+)")
+START_LINK_RE = re.compile(r"t\.me/([A-Za-z0-9_]+)\?start=([A-Za-z0-9_\-]+)", re.IGNORECASE)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 
 db.init_db(bootstrap_admin_ids=ADMIN_IDS)
@@ -97,6 +99,91 @@ def extract_link(text: str) -> str:
     # همیشه لینک واقعی (نهایی) ته پیامه؛ اگه لینک دیگه‌ای هم قبلش باشه
     # (تبلیغ، کانال و غیره) نباید اونو به اشتباه برداریم.
     return matches[-1]
+
+
+def extract_source_link(message) -> str:
+    """لینکِ زیر پست کانال مبدا رو در میاره؛ چه هایپرلینک روی یه کلمه باشه
+    (مثل «مشاهده» که خودمون هم همینجوری پست می‌کنیم) چه لینک خام توی متن."""
+    if not message:
+        return None
+    if message.entities:
+        for e in message.entities:
+            if isinstance(e, MessageEntityTextUrl):
+                return e.url
+        text = message.raw_text or ""
+        for e in message.entities:
+            if isinstance(e, MessageEntityUrl):
+                return text[e.offset:e.offset + e.length]
+    if message.raw_text:
+        m = LINK_RE.search(message.raw_text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def parse_start_link(link: str):
+    """t.me/<username>?start=<param> رو پارس میکنه؛ اگه فرمتش این نبود None برمیگردونه."""
+    m = START_LINK_RE.search(link or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
+    """دیپ‌لینکِ زیر پست کانال مبدا رو باز میکنه (وارد ربات مقصد میشه با /start).
+    اگه ربات به جای فایل، خواست عضو یه یا چند کانال بشیم (گیت اجباری)، از روی
+    دکمه‌های زیر پیامش کانال‌ها رو پیدا و عضو میشه، بعد دوباره تلاش میکنه (لوپ)
+    تا فایل واقعی رو بگیره یا تعداد تلاش‌ها تموم بشه."""
+    parsed = parse_start_link(link)
+    if not parsed:
+        raise RuntimeError(f"لینک دیپ‌لینک قابل تشخیص نبود (فرمت t.me/username?start=... نیست): {link}")
+    bot_username, start_param = parsed
+
+    async with user.conversation(bot_username, timeout=60) as conv:
+        await call_with_flood_retry(
+            lambda: conv.send_message(f"/start {start_param}"),
+            context=f"باز کردن دیپ‌لینک {bot_username}",
+        )
+        resp = await conv.get_response()
+
+        for _ in range(max_attempts):
+            if resp.document or resp.photo or resp.file:
+                return await user.download_media(resp, file=f"{DOWNLOAD_DIR}/")
+
+            joined_any = False
+            if resp.buttons:
+                for row in resp.buttons:
+                    for btn in row:
+                        url = getattr(btn, "url", None)
+                        if url and "t.me/" in url:
+                            if await join_from_identifier(url):
+                                joined_any = True
+
+            if joined_any:
+                await asyncio.sleep(2)
+
+            # دکمه‌ی «چک عضویت» (بدون url، یه دکمه‌ی callback) رو بزن؛
+            # اگه چنین دکمه‌ای نبود، دوباره /start رو بفرست.
+            clicked = False
+            if resp.buttons:
+                for row in resp.buttons:
+                    for btn in row:
+                        if getattr(btn, "url", None) is None:
+                            try:
+                                await call_with_flood_retry(
+                                    lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
+                                )
+                                clicked = True
+                            except Exception as e:
+                                log.warning("click failed for a button in %s: %s", bot_username, e)
+            if not clicked:
+                await call_with_flood_retry(
+                    lambda: conv.send_message(f"/start {start_param}"),
+                    context=f"باز کردن دوباره‌ی دیپ‌لینک {bot_username}",
+                )
+            resp = await conv.get_response()
+
+        raise RuntimeError(f"بعد از {max_attempts} تلاش، فایل از «{bot_username}» گرفته نشد: {link}")
 
 
 async def reconnect_user_client(session_string: str):
@@ -868,16 +955,41 @@ async def poll_src_channels():
                             if not msgs:
                                 continue
                             latest = msgs[0]
-                            if not (latest.document or latest.file):
+                            source_link = extract_source_link(latest)
+                            if not source_link and not (latest.document or latest.photo):
                                 continue
-                            fuid = latest.file.id if latest.file else str(latest.id)
-                            if db.already_downloaded(fuid):
+
+                            if source_link:
+                                dedup_key = source_link
+                            else:
+                                # حالت قدیمی: پست کانال مبدا خودش فایل چسبیده داره
+                                media_obj = latest.photo or latest.document
+                                dedup_key = str(media_obj.id) if media_obj else str(latest.id)
+
+                            if db.already_downloaded(dedup_key):
                                 continue
 
                             source_caption = latest.raw_text or ""
 
-                            file_path = await user.download_media(latest, file=f"{DOWNLOAD_DIR}/")
-                            db.mark_downloaded(fuid, target)
+                            try:
+                                if source_link:
+                                    # پست کانال مبدا فایل نداره، فقط یه دیپ‌لینک به یه ربات
+                                    # (مثل خودمون) داره؛ باید واردش بشیم، اگه گیت عضویت
+                                    # داشت عضو کانال‌هاش بشیم، و فایل رو ازش بگیریم.
+                                    file_path = await fetch_file_from_start_link(source_link)
+                                else:
+                                    file_path = await user.download_media(latest, file=f"{DOWNLOAD_DIR}/")
+                            except Exception as e:
+                                # جلوی تلاش بی‌نهایتِ همین پیام رو می‌گیریم و به ادمین خبر میدیم
+                                db.mark_downloaded(dedup_key, target)
+                                log.warning("could not fetch file for %s: %s", target, e)
+                                await notify_admins(
+                                    f"⚠️ نتونستم فایل رو از پستِ «{ch['title'] or target}» بگیرم.\n"
+                                    f"لینک: {source_link or '(فایل مستقیم روی خود پست)'}\nخطا: {e}"
+                                )
+                                continue
+
+                            db.mark_downloaded(dedup_key, target)
 
                             async with session_lock:
                                 link1 = await get_link_from_bot1(file_path)
