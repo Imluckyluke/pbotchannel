@@ -46,9 +46,6 @@ SETTINGS_LABELS = {
     "backup_bot_username": "ربات بکاپ",
     "channel_target": "چنل مقصد (پست)",
     "channel_display": "نمایش آیدی چنل",
-    "upload_btn_text": "متن دکمه آپلود",
-    "single_btn_text": "متن دکمه تکی",
-    "back_btn_text": "متن دکمه بازگشت",
 }
 
 
@@ -60,21 +57,12 @@ def is_admin(user_id: int) -> bool:
 def extract_link(text: str) -> str:
     if not text:
         raise RuntimeError("پیام خالی بود، لینکی توش نبود")
-    m = LINK_RE.search(text)
-    if not m:
+    matches = LINK_RE.findall(text)
+    if not matches:
         raise RuntimeError(f"لینکی توی پاسخ پیدا نشد:\n{text}")
-    return m.group(0)
-
-
-async def click_button(message, text_fragment: str):
-    if not message.buttons:
-        raise RuntimeError("این پیام دکمه‌ای نداشت")
-    for row in message.buttons:
-        for btn in row:
-            if text_fragment and text_fragment in (btn.text or ""):
-                await message.click(text=btn.text)
-                return
-    raise RuntimeError(f"دکمه‌ی «{text_fragment}» پیدا نشد")
+    # همیشه لینک واقعی (بکاپ) ته پیامه؛ اگه لینک دیگه‌ای هم قبلش باشه
+    # (تبلیغ، کانال و غیره) نباید اونو به اشتباه برداریم.
+    return matches[-1]
 
 
 async def reconnect_user_client(session_string: str):
@@ -416,18 +404,20 @@ async def get_backup_link(link: str) -> str:
     if not backup_bot:
         raise RuntimeError("اول از پنل، ربات بکاپ رو تنظیم کن")
 
-    upload_btn = db.get_setting("upload_btn_text")
-    single_btn = db.get_setting("single_btn_text")
-    back_btn = db.get_setting("back_btn_text")
-
     async with user.conversation(backup_bot, timeout=180) as conv:
+        # هر بار قبل از /admin باید /start بزنیم، وگرنه پنل بالا نمیاد
+        await conv.send_message("/start")
+        await conv.get_response()
+
         await conv.send_message("/admin")
         resp = await conv.get_response()
 
-        await click_button(resp, upload_btn)
+        # دکمه‌ی «آپلود فایل»: کلید چهارم کیبورد = ردیف دوم، کلید دوم (i, j از صفر شمرده میشه)
+        await resp.click(i=1, j=1)
         resp = await conv.get_response()
 
-        await click_button(resp, single_btn)
+        # دکمه‌ی «تکی»: ردیف اول، کلید اول (سمت چپ)
+        await resp.click(i=0, j=0)
         resp = await conv.get_response()  # منتظر پرامپت لینک
 
         await conv.send_message(link)
@@ -435,8 +425,9 @@ async def get_backup_link(link: str) -> str:
 
         backup_link = extract_link(resp.raw_text)
 
+        # دکمه‌ی «بازگشت»: فقط یه دکمه‌ست، همون تک ردیف/تک کلید (i=0, j=0)
         try:
-            await click_button(resp, back_btn)
+            await resp.click(i=0, j=0)
         except Exception as e:
             log.warning("back button click failed: %s", e)
 

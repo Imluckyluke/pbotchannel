@@ -12,9 +12,6 @@ DEFAULTS = {
     "backup_bot_username": "",
     "channel_target": "",       # چت آیدی/یوزرنیم مقصد ارسال پست (باید ربات ادمین کانال باشه)
     "channel_display": "",      # متنی که به جای "ایدی چنل" داخل پیام قرار میگیره
-    "upload_btn_text": "آپلود فایل",
-    "single_btn_text": "تکی",
-    "back_btn_text": "بازگشت به منو اصلی",
     "session_string": "",       # با پنل داخل ربات (🔑 ورود سشن جدید) پر میشه
 }
 
