@@ -130,79 +130,132 @@ def parse_start_link(link: str):
     return m.group(1), m.group(2)
 
 
-async def fetch_file_from_start_link(link: str, max_attempts: int = 6) -> str:
+def find_start_link_in_message(message) -> str:
+    """توی یه پیامِ جوابِ ربات (متن، هایپرلینک، یا دکمه‌های url‌دار) دنبال یه
+    دیپ‌لینک جدید (t.me/username?start=...) میگرده؛ برای حالتی که ربات اول
+    به‌جای گیت عضویت یا فایل، یه لینک دیگه (همون ربات یا یه ربات دوم) برمیگردونه."""
+    candidates = []
+    if message.buttons:
+        for row in message.buttons:
+            for btn in row:
+                url = getattr(btn, "url", None)
+                if url:
+                    candidates.append(url)
+    if message.entities:
+        for e in message.entities:
+            if isinstance(e, MessageEntityTextUrl):
+                candidates.append(e.url)
+        text = message.raw_text or ""
+        for e in message.entities:
+            if isinstance(e, MessageEntityUrl):
+                candidates.append(text[e.offset:e.offset + e.length])
+    if message.raw_text:
+        candidates.extend(LINK_RE.findall(message.raw_text))
+    for c in candidates:
+        if parse_start_link(c):
+            return c
+    return None
+
+
+async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_retries: int = 4) -> str:
     """دیپ‌لینکِ زیر پست کانال مبدا رو باز میکنه (وارد ربات مقصد میشه با /start).
-    اگه ربات به جای فایل، خواست عضو یه یا چند کانال بشیم (گیت اجباری)، از روی
-    دکمه‌های زیر پیامش کانال‌ها رو پیدا و عضو میشه، بعد دوباره تلاش میکنه (لوپ)
-    تا فایل واقعی رو بگیره یا تعداد تلاش‌ها تموم بشه."""
-    parsed = parse_start_link(link)
-    if not parsed:
-        raise RuntimeError(f"لینک دیپ‌لینک قابل تشخیص نبود (فرمت t.me/username?start=... نیست): {link}")
-    bot_username, start_param = parsed
-    log.info("deeplink: در حال باز کردن گفتگو با %s (start=%s)", bot_username, start_param)
+    دو حالت رو پشتیبانی میکنه:
+    - ربات همون اول گیت عضویت (join gate) نشون میده: دکمه‌های عضویت رو پیدا و
+      عضو میشه، بعد دکمه‌ی تایید رو میزنه (یا دوباره /start میفرسته)، تا فایل بیاد.
+    - ربات به‌جای گیت یا فایل، یه دیپ‌لینک دیگه برمیگردونه (همون ربات با
+      پارامتر متفاوت، یا یه ربات دومِ کاملاً جدا) — این حالت رو هم دنبال
+      میکنه (max_hops بار) تا برسه به جایی که واقعاً فایل یا گیت عضویت باشه."""
+    current_link = link
+    visited = set()
 
-    async with user.conversation(bot_username, timeout=60) as conv:
-        await call_with_flood_retry(
-            lambda: conv.send_message(f"/start {start_param}"),
-            context=f"باز کردن دیپ‌لینک {bot_username}",
-        )
-        resp = await conv.get_response()
-        log.info(
-            "deeplink: %s -> اولین پاسخ رسید (فایل داره: %s، تعداد ردیف دکمه: %s)",
-            bot_username, bool(resp.document or resp.photo or resp.file),
-            len(resp.buttons) if resp.buttons else 0,
-        )
+    for hop in range(max_hops):
+        if current_link in visited:
+            raise RuntimeError(f"لینک تکراری دیده شد (احتمالاً حلقه‌ست): {current_link}")
+        visited.add(current_link)
 
-        for attempt in range(max_attempts):
-            if resp.document or resp.photo or resp.file:
-                log.info("deeplink: %s -> فایل رسید، در حال دانلود (تلاش %s)", bot_username, attempt + 1)
-                return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
+        parsed = parse_start_link(current_link)
+        if not parsed:
+            raise RuntimeError(f"لینک دیپ‌لینک قابل تشخیص نبود (فرمت t.me/username?start=... نیست): {current_link}")
+        bot_username, start_param = parsed
+        log.info("deeplink: مرحله %s/%s - باز کردن %s (start=%s)", hop + 1, max_hops, bot_username, start_param)
 
+        async with user.conversation(bot_username, timeout=60) as conv:
+            await call_with_flood_retry(
+                lambda: conv.send_message(f"/start {start_param}"),
+                context=f"باز کردن دیپ‌لینک {bot_username}",
+            )
+            resp = await conv.get_response()
             log.info(
-                "deeplink: %s -> تلاش %s/%s: فایل هنوز نیومده، دنبال دکمه‌های عضویت می‌گردم",
-                bot_username, attempt + 1, max_attempts,
+                "deeplink: %s -> اولین پاسخ رسید (فایل داره: %s، تعداد ردیف دکمه: %s)",
+                bot_username, bool(resp.document or resp.photo or resp.file),
+                len(resp.buttons) if resp.buttons else 0,
             )
 
-            joined_any = False
-            if resp.buttons:
-                for row in resp.buttons:
-                    for btn in row:
-                        url = getattr(btn, "url", None)
-                        if url and "t.me/" in url:
-                            log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: %s", bot_username, url)
-                            if await join_from_identifier(url):
-                                log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
-                                joined_any = True
-                            else:
-                                log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
+            for attempt in range(max_inner_retries):
+                if resp.document or resp.photo or resp.file:
+                    log.info("deeplink: %s -> فایل رسید، در حال دانلود", bot_username)
+                    return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
 
-            if joined_any:
-                await asyncio.sleep(2)
-
-            # دکمه‌ی «چک عضویت» (بدون url، یه دکمه‌ی callback) رو بزن؛
-            # اگه چنین دکمه‌ای نبود، دوباره /start رو بفرست.
-            clicked = False
-            if resp.buttons:
-                for row in resp.buttons:
-                    for btn in row:
-                        if getattr(btn, "url", None) is None:
-                            try:
-                                log.info("deeplink: %s -> کلیک روی دکمه‌ی تایید عضویت", bot_username)
-                                await call_with_flood_retry(
-                                    lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
-                                )
-                                clicked = True
-                            except Exception as e:
-                                log.warning("click failed for a button in %s: %s", bot_username, e)
-            if not clicked:
-                log.info("deeplink: %s -> دکمه‌ی callback نبود، دوباره /start می‌فرستم", bot_username)
-                await call_with_flood_retry(
-                    lambda: conv.send_message(f"/start {start_param}"),
-                    context=f"باز کردن دوباره‌ی دیپ‌لینک {bot_username}",
+                log.info(
+                    "deeplink: %s -> تلاش %s/%s: فایل هنوز نیومده، دنبال دکمه‌های عضویت می‌گردم",
+                    bot_username, attempt + 1, max_inner_retries,
                 )
-            resp = await conv.get_response()
 
-        raise RuntimeError(f"بعد از {max_attempts} تلاش، فایل از «{bot_username}» گرفته نشد: {link}")
+                joined_any = False
+                if resp.buttons:
+                    for row in resp.buttons:
+                        for btn in row:
+                            url = getattr(btn, "url", None)
+                            # دکمه‌ای که خودش یه دیپ‌لینک دیگه‌ست (start=...) رو اینجا
+                            # عضو نمیشیم؛ اون میره تو مرحله‌ی «دنبال کردن لینک بعدی»
+                            if url and "t.me/" in url and not parse_start_link(url):
+                                log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: %s", bot_username, url)
+                                if await join_from_identifier(url):
+                                    log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
+                                    joined_any = True
+                                else:
+                                    log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
+
+                if joined_any:
+                    await asyncio.sleep(2)
+
+                # دکمه‌ی «چک عضویت» (بدون url، یه دکمه‌ی callback) رو بزن
+                clicked = False
+                if resp.buttons:
+                    for row in resp.buttons:
+                        for btn in row:
+                            if getattr(btn, "url", None) is None:
+                                try:
+                                    log.info("deeplink: %s -> کلیک روی دکمه‌ی تایید عضویت", bot_username)
+                                    await call_with_flood_retry(
+                                        lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
+                                    )
+                                    clicked = True
+                                except Exception as e:
+                                    log.warning("click failed for a button in %s: %s", bot_username, e)
+
+                if not joined_any and not clicked:
+                    # نه دکمه‌ی عضویتی بود نه دکمه‌ی تاییدی؛ همینجا دیگه کاری از
+                    # دستمون بر نمیاد، بریم سراغ چک کردن لینک بعدی
+                    break
+
+                log.info("deeplink: %s -> دوباره منتظر پاسخ جدید هستیم", bot_username)
+                resp = await conv.get_response()
+
+            if resp.document or resp.photo or resp.file:
+                log.info("deeplink: %s -> فایل رسید، در حال دانلود", bot_username)
+                return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
+
+            # فایل نیومد؛ شاید این ربات به‌جای گیت/فایل یه دیپ‌لینک دیگه داده
+            next_link = find_start_link_in_message(resp)
+            if next_link and next_link not in visited:
+                log.info("deeplink: %s -> فایل نیومد ولی یه دیپ‌لینک جدید پیدا شد: %s", bot_username, next_link)
+                current_link = next_link
+                continue
+
+            raise RuntimeError(f"بعد از باز کردن «{bot_username}»، نه فایل اومد نه لینک جدیدی پیدا شد.")
+
+    raise RuntimeError(f"بعد از {max_hops} مرحله (دنبال کردن لینک‌های زنجیره‌ای)، فایل نهایی گرفته نشد: {link}")
 
 
 async def reconnect_user_client(session_string: str):
