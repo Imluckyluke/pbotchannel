@@ -10,7 +10,10 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import (
+    MessageEntityTextUrl, MessageEntityUrl, MessageMediaPhoto, MessageMediaDocument,
+    Channel, Chat,
+)
 from telethon.errors import (
     RPCError,
     FloodWaitError,
@@ -326,6 +329,45 @@ async def resolve_channel_entity(target):
         return await user.get_entity(ident)
 
 
+async def list_session_channels():
+    """کانال‌ها و گروه‌هایی که اکانت سشن عضوشونه رو برمیگردونه (نه چت خصوصی
+    و نه ربات‌ها)؛ برای انتخاب از لیست به‌جای وارد کردن دستیِ لینک/آیدی —
+    چون این‌ها مستقیم از get_dialogs میان، همیشه توی کشِ Telethon هستن و
+    مشکل «Could not find the input entity» براشون پیش نمیاد."""
+    if not session_connected():
+        return []
+    dialogs = await user.get_dialogs()
+    channels = []
+    seen = set()
+    for d in dialogs:
+        entity = d.entity
+        if isinstance(entity, (Channel, Chat)) and entity.id not in seen:
+            seen.add(entity.id)
+            channels.append({"id": entity.id, "title": d.name or getattr(entity, "title", str(entity.id))})
+    channels.sort(key=lambda c: c["title"] or "")
+    return channels
+
+
+CHANNEL_PICKER_PAGE_SIZE = 6
+
+
+async def channel_picker_buttons(kind: str, page: int):
+    """kind: 'src' یا 'dest'؛ یه صفحه از کانال‌های سشن رو به‌عنوان دکمه میسازه."""
+    channels = await list_session_channels()
+    start = page * CHANNEL_PICKER_PAGE_SIZE
+    page_channels = channels[start:start + CHANNEL_PICKER_PAGE_SIZE]
+    rows = [[Button.inline((c["title"] or str(c["id"]))[:60], data=f"{kind}pick:add:{c['id']}")] for c in page_channels]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ قبلی", data=f"{kind}pick:page:{page - 1}"))
+    if start + CHANNEL_PICKER_PAGE_SIZE < len(channels):
+        nav.append(Button.inline("بعدی ➡️", data=f"{kind}pick:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("🔙 بازگشت", data="menu:destchannels" if kind == "dest" else "menu:srcchannels")])
+    return rows, len(channels)
+
+
 def session_connected() -> bool:
     return user.is_connected()
 
@@ -481,7 +523,8 @@ def dest_channels_menu_buttons():
                           style="success" if c["enabled"] else "danger"),
             Button.inline("❌ حذف", data=f"destchannel:rm:{c['id']}", style="danger"),
         ])
-    rows.append([Button.inline("➕ افزودن کانال مقصد", data="destchannel:add", style="success")])
+    rows.append([Button.inline("➕ افزودن کانال مقصد (لینک/آیدی)", data="destchannel:add", style="success")])
+    rows.append([Button.inline("📋 انتخاب از لیست کانال‌های سشن", data="destpick:page:0", style="primary")])
     rows.append([Button.inline("🔙 بازگشت", data="menu:main")])
     return rows
 
@@ -491,7 +534,8 @@ def src_channels_menu_buttons():
         [Button.inline(f"❌ حذف {c['title'] or c['target']}", data=f"srcchannel:rm:{c['id']}", style="danger")]
         for c in db.list_src_channels()
     ]
-    rows.append([Button.inline("➕ افزودن کانال مبدا", data="srcchannel:add", style="success")])
+    rows.append([Button.inline("➕ افزودن کانال مبدا (لینک/آیدی)", data="srcchannel:add", style="success")])
+    rows.append([Button.inline("📋 انتخاب از لیست کانال‌های سشن", data="srcpick:page:0", style="primary")])
     rows.append([Button.inline("🔙 بازگشت", data="menu:main")])
     return rows
 
@@ -692,6 +736,37 @@ async def callback_handler(event):
         cid = int(data.split(":")[2])
         db.remove_src_channel(cid)
         await event.edit("کانال مبدا حذف شد.\n\nکانال‌های مبدا:", buttons=src_channels_menu_buttons())
+        return
+
+    if data.startswith("srcpick:page:") or data.startswith("destpick:page:"):
+        kind = "src" if data.startswith("srcpick:") else "dest"
+        page = int(data.split(":")[2])
+        if not session_connected():
+            await event.answer("اول باید سشن وصل باشه (از پنل «ورود با شماره» یا Session String بزن).", alert=True)
+            return
+        buttons, total = await channel_picker_buttons(kind, page)
+        label = "کانال مبدا" if kind == "src" else "کانال مقصد"
+        text = (
+            f"یکی از کانال‌ها/گروه‌های زیر رو به‌عنوان {label} انتخاب کن ({total} تا پیدا شد):"
+            if total else "هیچ کانال/گروهی توی اکانت سشن پیدا نشد؛ اول باید سشن عضوش باشه."
+        )
+        await event.edit(text, buttons=buttons)
+        return
+
+    if data.startswith("srcpick:add:") or data.startswith("destpick:add:"):
+        kind = "src" if data.startswith("srcpick:") else "dest"
+        channel_id = int(data.split(":")[2])
+        try:
+            entity = await resolve_channel_entity(channel_id)
+            title = getattr(entity, "title", str(channel_id))
+            if kind == "src":
+                db.add_src_channel(entity.id, title)
+                await event.edit(f"کانال مبدا اضافه شد: {title}", buttons=src_channels_menu_buttons())
+            else:
+                db.add_dest_channel(entity.id, title)
+                await event.edit(f"کانال مقصد اضافه شد: {title}", buttons=dest_channels_menu_buttons())
+        except Exception as e:
+            await event.answer(f"خطا: {e}", alert=True)
         return
 
     if data == "menu:admins":
