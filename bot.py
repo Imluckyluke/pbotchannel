@@ -157,7 +157,7 @@ def find_start_link_in_message(message) -> str:
     return None
 
 
-async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_retries: int = 4):
+async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_retries: int = 10):
     """دیپ‌لینکِ زیر پست کانال مبدا رو باز میکنه (وارد ربات مقصد میشه با /start)
     و پیامِ حاوی فایل رو برمیگردونه (نه مسیر یه فایل دانلودشده — فایل اصلاً
     روی سرور ما دانلود نمیشه؛ بعداً موقع فرستادن به ربات اول، Telethon خودش
@@ -245,7 +245,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_ret
                                 log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
 
                 if joined_any:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
 
                 # دکمه‌ی «چک عضویت» (بدون url، یه دکمه‌ی callback) رو بزن
                 clicked = False
@@ -1058,8 +1058,23 @@ async def process_file(event):
             os.remove(file_path)
 
 
+CHANNEL_MENTION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,31}")
+
+
 def build_channel_message(raw_text: str, link: str, channel_display: str, trigger_word: str) -> str:
     text = raw_text.replace("ایدی کانال", channel_display or "")
+
+    # وقتی کپشن از یه پست کانال مبدا کپی شده (نه دستیِ خودمون)، به‌جای
+    # placeholder «ایدی کانال»، ته متن آیدی/یوزرنیم واقعیِ خودِ کانال مبدا
+    # هست (چون اونا هم قبلاً جای این placeholder رو با آیدی خودشون پر
+    # کردن). آخرین @یوزرنیمِ توی متن رو با آیدیِ کانال مقصدِ ما جایگزین
+    # می‌کنیم تا این برچسب درست بشه.
+    if channel_display:
+        mentions = list(CHANNEL_MENTION_RE.finditer(text))
+        if mentions:
+            last = mentions[-1]
+            text = text[:last.start()] + channel_display + text[last.end():]
+
     text = text.replace(trigger_word, f'<a href="{link}">{trigger_word}</a>')
     return text
 
