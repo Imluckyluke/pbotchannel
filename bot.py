@@ -157,8 +157,12 @@ def find_start_link_in_message(message) -> str:
     return None
 
 
-async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_retries: int = 4) -> str:
-    """دیپ‌لینکِ زیر پست کانال مبدا رو باز میکنه (وارد ربات مقصد میشه با /start).
+async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_retries: int = 4):
+    """دیپ‌لینکِ زیر پست کانال مبدا رو باز میکنه (وارد ربات مقصد میشه با /start)
+    و پیامِ حاوی فایل رو برمیگردونه (نه مسیر یه فایل دانلودشده — فایل اصلاً
+    روی سرور ما دانلود نمیشه؛ بعداً موقع فرستادن به ربات اول، Telethon خودش
+    فایل رو سمت سرورهای تلگرام کپی میکنه، که هم سریع‌تره هم فضای دیسک سرور
+    رو اشغال نمی‌کنه).
     دو حالت رو پشتیبانی میکنه:
     - ربات همون اول گیت عضویت (join gate) نشون میده: دکمه‌های عضویت رو پیدا و
       عضو میشه، بعد دکمه‌ی تایید رو میزنه (یا دوباره /start میفرسته)، تا فایل بیاد.
@@ -193,28 +197,52 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_ret
 
             for attempt in range(max_inner_retries):
                 if resp.document or resp.photo or resp.file:
-                    log.info("deeplink: %s -> فایل رسید، در حال دانلود", bot_username)
-                    return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
+                    log.info("deeplink: %s -> فایل رسید (بدون دانلود، مستقیم فوروارد میشه)", bot_username)
+                    return resp
 
                 log.info(
                     "deeplink: %s -> تلاش %s/%s: فایل هنوز نیومده، دنبال دکمه‌های عضویت می‌گردم",
                     bot_username, attempt + 1, max_inner_retries,
                 )
+                if resp.buttons:
+                    for row in resp.buttons:
+                        for btn in row:
+                            log.info(
+                                "deeplink: %s -> دکمه: متن=«%s» url=%s callback=%s",
+                                bot_username, getattr(btn, "text", ""), getattr(btn, "url", None),
+                                getattr(btn, "url", None) is None,
+                            )
 
                 joined_any = False
                 if resp.buttons:
                     for row in resp.buttons:
                         for btn in row:
                             url = getattr(btn, "url", None)
+                            if not url or ("t.me/" not in url and "telegram.me/" not in url):
+                                continue
                             # دکمه‌ای که خودش یه دیپ‌لینک دیگه‌ست (start=...) رو اینجا
                             # عضو نمیشیم؛ اون میره تو مرحله‌ی «دنبال کردن لینک بعدی»
-                            if url and "t.me/" in url and not parse_start_link(url):
-                                log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: %s", bot_username, url)
-                                if await join_from_identifier(url):
-                                    log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
-                                    joined_any = True
-                                else:
-                                    log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
+                            if parse_start_link(url):
+                                log.info(
+                                    "deeplink: %s -> دکمه‌ی «%s» یه دیپ‌لینکه (%s)، نه کانال، رد میشه از این مرحله",
+                                    bot_username, getattr(btn, "text", ""), url,
+                                )
+                                continue
+                            # ممکنه این دکمه یه ربات تبلیغاتی باشه که وسط گیت عضویت
+                            # قاطی شده، نه یه کانال واقعی؛ قبل از تلاش برای جوین،
+                            # مطمئن میشیم واقعاً کانال/گروهه.
+                            if not await is_joinable_channel_link(url):
+                                log.info(
+                                    "deeplink: %s -> دکمه‌ی «%s» (%s) کانال/گروه نیست (احتمالاً ربات تبلیغاتیه)، رد میشه",
+                                    bot_username, getattr(btn, "text", ""), url,
+                                )
+                                continue
+                            log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: «%s» -> %s", bot_username, getattr(btn, "text", ""), url)
+                            if await join_from_identifier(url):
+                                log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
+                                joined_any = True
+                            else:
+                                log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
 
                 if joined_any:
                     await asyncio.sleep(2)
@@ -243,8 +271,8 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 4, max_inner_ret
                 resp = await conv.get_response()
 
             if resp.document or resp.photo or resp.file:
-                log.info("deeplink: %s -> فایل رسید، در حال دانلود", bot_username)
-                return await safe_download_media(resp, file=f"{DOWNLOAD_DIR}/")
+                log.info("deeplink: %s -> فایل رسید (بدون دانلود، مستقیم فوروارد میشه)", bot_username)
+                return resp
 
             # فایل نیومد؛ شاید این ربات به‌جای گیت/فایل یه دیپ‌لینک دیگه داده
             next_link = find_start_link_in_message(resp)
@@ -315,6 +343,24 @@ async def safe_download_media(entity_or_message, **kwargs):
                 f"نمی‌تونه دانلودش کنه (باگ شناخته‌شده‌ی Telethon): {e}"
             ) from e
         raise
+
+
+async def is_joinable_channel_link(url: str) -> bool:
+    """چک میکنه یه لینک واقعاً به یه کانال/گروه اشاره داره، نه به یه ربات
+    (مثلا یه ربات تبلیغاتی که دکمه‌اش وسط گیت عضویت قاطی شده). لینک‌های
+    دعوت خصوصی (+hash یا joinchat) همیشه قابل‌عضویت فرض میشن، چون فقط
+    برای کانال/گروه صادر میشن، نه ربات."""
+    m = INVITE_LINK_RE.search(url or "")
+    if not m:
+        return False
+    if "/+" in url or "joinchat" in url:
+        return True
+    username = m.group(1)
+    try:
+        entity = await user.get_entity(username)
+    except Exception:
+        return False
+    return not getattr(entity, "bot", False) and type(entity).__name__ != "User"
 
 
 async def join_from_identifier(identifier: str) -> bool:
@@ -901,7 +947,11 @@ async def pending_input_handler(event):
 
 
 # ---------------------------------------------------------------- core flow
-async def get_link_from_bot1(file_path: str) -> str:
+async def get_link_from_bot1(file) -> str:
+    """file: یا مسیر یه فایل محلی، یا یه پیام تلگرامی حاوی مدیا (Message) —
+    توی حالت دوم Telethon خودش فایل رو سمت سرورهای تلگرام کپی میکنه، بدون
+    اینکه ما مجبور باشیم دانلودش کنیم و دوباره آپلود کنیم (سریع‌تر و سبک‌تر
+    برای سرور)."""
     if not session_connected():
         raise RuntimeError("سشن وصل نیست؛ از پنل روی «ورود با شماره» یا «Session String» بزن")
 
@@ -910,7 +960,7 @@ async def get_link_from_bot1(file_path: str) -> str:
         raise RuntimeError("اول از پنل، ربات اول رو تنظیم کن")
 
     async with user.conversation(bot1, timeout=180) as conv:
-        await call_with_flood_retry(lambda: conv.send_file(file_path), context="ارسال فایل به ربات اول")
+        await call_with_flood_retry(lambda: conv.send_file(file), context="ارسال فایل به ربات اول")
         resp = await conv.get_response()
         return extract_link(resp.raw_text)
 
@@ -1161,12 +1211,14 @@ async def poll_src_channels():
                                     # (مثل خودمون) داره؛ باید واردش بشیم، اگه گیت عضویت
                                     # داشت عضو کانال‌هاش بشیم، و فایل رو ازش بگیریم.
                                     log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
-                                    file_path = await fetch_file_from_start_link(source_link)
-                                    log.info("watch: %s -> فایل از دیپ‌لینک گرفته شد: %s", target, file_path)
+                                    file_message = await fetch_file_from_start_link(source_link)
+                                    log.info("watch: %s -> پیام حاوی فایل از دیپ‌لینک گرفته شد", target)
                                 else:
-                                    log.info("watch: %s -> دانلود مستقیم فایل چسبیده به پست", target)
-                                    file_path = await safe_download_media(latest, file=f"{DOWNLOAD_DIR}/")
-                                    log.info("watch: %s -> دانلود مستقیم موفق: %s", target, file_path)
+                                    # حالت قدیمی: پست کانال مبدا خودش فایل چسبیده داره؛
+                                    # چیزی دانلود نمی‌کنیم، خودِ پیام رو مستقیم به ربات
+                                    # اول می‌فرستیم (Telethon سمت سرور کپی می‌کنه).
+                                    log.info("watch: %s -> فایل مستقیم روی خود پست، بدون دانلود فرستاده میشه", target)
+                                    file_message = latest
                             except Exception as e:
                                 # جلوی تلاش بی‌نهایتِ همین پیام رو می‌گیریم و به ادمین خبر میدیم
                                 db.mark_downloaded(dedup_key, target)
@@ -1180,15 +1232,12 @@ async def poll_src_channels():
                             db.mark_downloaded(dedup_key, target)
 
                             async with session_lock:
-                                log.info("watch: %s -> در حال ارسال فایل به ربات اول", target)
-                                link1 = await get_link_from_bot1(file_path)
+                                log.info("watch: %s -> در حال ارسال فایل به ربات اول (بدون دانلود)", target)
+                                link1 = await get_link_from_bot1(file_message)
                                 log.info("watch: %s -> لینک ربات اول گرفته شد: %s", target, link1)
                                 log.info("watch: %s -> در حال ارسال لینک به ربات دوم", target)
                                 final_link = await get_link_from_bot2(link1)
                                 log.info("watch: %s -> لینک نهایی ربات دوم: %s", target, final_link)
-
-                            if file_path and os.path.exists(file_path):
-                                os.remove(file_path)
 
                             log.info("watch: %s -> در حال پست به کانال‌های مقصد فعال", target)
                             await auto_post_after_watch(ch["title"] or str(target), final_link, source_caption)
