@@ -197,6 +197,8 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                 bot_username, bool(resp.document or resp.photo or resp.file),
                 len(resp.buttons) if resp.buttons else 0,
             )
+            if not resp.buttons and not (resp.document or resp.photo or resp.file):
+                log.info("deeplink: %s -> متن این پیام: %r", bot_username, resp.raw_text)
 
             for attempt in range(max_inner_retries):
                 if resp.document or resp.photo or resp.file:
@@ -266,8 +268,23 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                                     log.warning("click failed for a button in %s: %s", bot_username, e)
 
                 if not joined_any and not clicked:
-                    # نه دکمه‌ی عضویتی بود نه دکمه‌ی تاییدی؛ همینجا دیگه کاری از
-                    # دستمون بر نمیاد، بریم سراغ چک کردن لینک بعدی
+                    if not resp.buttons:
+                        # این پیام نه فایل داشت نه هیچ دکمه‌ای (نه اینلاین نه
+                        # کیبورد معمولی)؛ شاید فقط یه پیام میانیه (مثلاً «صبر
+                        # کن...») و پیام واقعی چند ثانیه دیگه میاد.
+                        log.info(
+                            "deeplink: %s -> نه فایل نه دکمه‌ای تو این پیام نبود، تا ۱۵ ثانیه منتظر پیام بعدی می‌مونیم",
+                            bot_username,
+                        )
+                        try:
+                            resp = await conv.get_response(timeout=15)
+                            continue
+                        except asyncio.TimeoutError:
+                            log.info("deeplink: %s -> پیام دیگه‌ای نیومد", bot_username)
+                            break
+                    # دکمه بود ولی هیچ‌کدوم قابل استفاده نبودن (نه لینک عضویت
+                    # قابل‌تشخیص، نه دکمه‌ی تایید)؛ دیگه کاری از دستمون بر
+                    # نمیاد، بریم سراغ چک کردن لینک بعدی توی متن/دکمه‌ها.
                     break
 
                 log.info("deeplink: %s -> دوباره منتظر پاسخ جدید هستیم", bot_username)
