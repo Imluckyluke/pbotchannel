@@ -296,6 +296,34 @@ async def reconnect_user_client(session_string: str):
         pass
     user = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await user.start()
+    await warm_up_entity_cache()
+
+
+async def warm_up_entity_cache():
+    """چون از StringSession استفاده میکنیم (نه فایل سشن)، کش موجودیت‌های
+    Telethon بین هر بار بالا اومدنِ پروسه از صفر شروع میشه. بدون این کش،
+    get_entity(آیدی_عددی) برای کانال‌هایی که فقط با آیدی خام (نه یوزرنیم/
+    لینک) اضافه شدن شکست میخوره: 'Could not find the input entity'.
+    گرفتن کامل دیالوگ‌ها این کش رو برای همه‌ی چت/کانال‌هایی که اکانت
+    سشن عضوشونه از نو می‌سازه."""
+    try:
+        await user.get_dialogs()
+        log.info("session entity cache warmed up (get_dialogs)")
+    except Exception as e:
+        log.warning("could not warm up entity cache: %s", e)
+
+
+async def resolve_channel_entity(target):
+    """target: یوزرنیم/لینک، یا آیدی عددی (خام یا با پیشوند -100). اگه به
+    خاطر خالی بودن کش (بعد از ری‌استارت) شکست خورد، یه‌بار کش رو دوباره
+    می‌سازه و امتحان میکنه."""
+    ident = int(target) if str(target).lstrip("-").isdigit() else target
+    try:
+        return await user.get_entity(ident)
+    except ValueError:
+        log.info("resolve_channel_entity: کش پیدا نشد برای %s، در حال بازسازی کش دیالوگ‌ها", target)
+        await warm_up_entity_cache()
+        return await user.get_entity(ident)
 
 
 def session_connected() -> bool:
@@ -861,10 +889,17 @@ async def pending_input_handler(event):
             PENDING_MSG.pop(admin_id, None)
             raise events.StopPropagation
         try:
-            target = value if not value.lstrip("-").isdigit() else int(value)
-            entity = await user.get_entity(target)
+            entity = await resolve_channel_entity(value)
             db.add_src_channel(entity.id, getattr(entity, "title", value))
             await send_or_edit(admin_id, event, f"کانال مبدا اضافه شد: {getattr(entity, 'title', value)}", buttons=src_channels_menu_buttons())
+        except ValueError:
+            await send_or_edit(
+                admin_id, event,
+                "با آیدی عددی خام پیدا نشد. اگه این کانال با یوزرنیم (@channel) یا لینک "
+                "دعوتشه، به‌جای آیدی عددی همون رو بفرست؛ چون برای آیدی خام، فقط وقتی "
+                "کار میکنه که اکانت سشن قبلاً واقعاً عضو این کانال بوده باشه.",
+                buttons=src_channels_menu_buttons(),
+            )
         except Exception as e:
             await send_or_edit(admin_id, event, f"خطا: {e}", buttons=src_channels_menu_buttons())
         PENDING_MSG.pop(admin_id, None)
@@ -1038,8 +1073,10 @@ async def post_to_channel(channel: dict, raw_text: str, link: str):
     trigger_word = db.get_setting("trigger_word") or "مشاهده"
     final_text = build_channel_message(raw_text, link, channel["display"], trigger_word)
     name = channel["display"] or channel["target"]
+    target = channel["target"]
+    peer = int(target) if str(target).lstrip("-").isdigit() else target
     await call_with_flood_retry(
-        lambda: user.send_message(channel["target"], final_text, parse_mode="html", link_preview=False),
+        lambda: user.send_message(peer, final_text, parse_mode="html", link_preview=False),
         context=f"ارسال به {name}",
     )
 
@@ -1173,7 +1210,7 @@ async def poll_src_channels():
                         try:
                             target = ch["target"]
                             log.info("watch: checking source channel %s (%s)", target, ch.get("title"))
-                            entity = await user.get_entity(int(target) if str(target).lstrip("-").isdigit() else target)
+                            entity = await resolve_channel_entity(target)
                             msgs = await user.get_messages(entity, limit=1)
                             if not msgs:
                                 log.info("watch: %s has no messages at all", target)
