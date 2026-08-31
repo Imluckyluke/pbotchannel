@@ -200,88 +200,100 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
             if not resp.buttons and not (resp.document or resp.photo or resp.file):
                 log.info("deeplink: %s -> متن این پیام: %r", bot_username, resp.raw_text)
 
+            advanced_to_next_hop = False
+
             for attempt in range(max_inner_retries):
                 if resp.document or resp.photo or resp.file:
                     log.info("deeplink: %s -> فایل رسید (بدون دانلود، مستقیم فوروارد میشه)", bot_username)
                     return resp
 
+                if not resp.buttons:
+                    # این پیام هیچ دکمه‌ای (نه اینلاین نه کیبورد معمولی) نداره؛
+                    # پس اصلاً معنی نداره دنبال دکمه‌ی عضویت بگردیم. اول ببینیم
+                    # آیا خودِ این پیام یه دیپ‌لینکِ بعدی (زنجیره‌ای) داده یا نه.
+                    next_link = find_start_link_in_message(resp)
+                    if next_link and next_link not in visited:
+                        log.info(
+                            "deeplink: %s -> این پیام دکمه نداشت، مستقیم رفت سراغ لینک بعدی: %s",
+                            bot_username, next_link,
+                        )
+                        current_link = next_link
+                        advanced_to_next_hop = True
+                        break
+
+                    # نه فایل، نه دکمه، نه لینکی تو متن؛ شاید فقط یه پیام
+                    # میانیه (مثلاً «صبر کن...») و پیام واقعی چند ثانیه دیگه میاد.
+                    log.info(
+                        "deeplink: %s -> نه فایل، نه دکمه، نه لینکی پیدا شد؛ تا ۱۵ ثانیه منتظر پیام بعدی می‌مونیم",
+                        bot_username,
+                    )
+                    try:
+                        resp = await conv.get_response(timeout=15)
+                        continue
+                    except asyncio.TimeoutError:
+                        log.info("deeplink: %s -> پیام دیگه‌ای نیومد", bot_username)
+                        raise RuntimeError(f"بعد از باز کردن «{bot_username}»، نه فایل اومد نه لینک/دکمه‌ای پیدا شد.")
+
                 log.info(
                     "deeplink: %s -> تلاش %s/%s: فایل هنوز نیومده، دنبال دکمه‌های عضویت می‌گردم",
                     bot_username, attempt + 1, max_inner_retries,
                 )
-                if resp.buttons:
-                    for row in resp.buttons:
-                        for btn in row:
-                            log.info(
-                                "deeplink: %s -> دکمه: متن=«%s» url=%s callback=%s",
-                                bot_username, getattr(btn, "text", ""), getattr(btn, "url", None),
-                                getattr(btn, "url", None) is None,
-                            )
+                for row in resp.buttons:
+                    for btn in row:
+                        log.info(
+                            "deeplink: %s -> دکمه: متن=«%s» url=%s callback=%s",
+                            bot_username, getattr(btn, "text", ""), getattr(btn, "url", None),
+                            getattr(btn, "url", None) is None,
+                        )
 
                 joined_any = False
-                if resp.buttons:
-                    for row in resp.buttons:
-                        for btn in row:
-                            url = getattr(btn, "url", None)
-                            if not url or ("t.me/" not in url and "telegram.me/" not in url):
-                                continue
-                            # دکمه‌ای که خودش یه دیپ‌لینک دیگه‌ست (start=...) رو اینجا
-                            # عضو نمیشیم؛ اون میره تو مرحله‌ی «دنبال کردن لینک بعدی»
-                            if parse_start_link(url):
-                                log.info(
-                                    "deeplink: %s -> دکمه‌ی «%s» یه دیپ‌لینکه (%s)، نه کانال، رد میشه از این مرحله",
-                                    bot_username, getattr(btn, "text", ""), url,
-                                )
-                                continue
-                            # ممکنه این دکمه یه ربات تبلیغاتی باشه که وسط گیت عضویت
-                            # قاطی شده، نه یه کانال واقعی؛ قبل از تلاش برای جوین،
-                            # مطمئن میشیم واقعاً کانال/گروهه.
-                            if not await is_joinable_channel_link(url):
-                                log.info(
-                                    "deeplink: %s -> دکمه‌ی «%s» (%s) کانال/گروه نیست (احتمالاً ربات تبلیغاتیه)، رد میشه",
-                                    bot_username, getattr(btn, "text", ""), url,
-                                )
-                                continue
-                            log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: «%s» -> %s", bot_username, getattr(btn, "text", ""), url)
-                            if await join_from_identifier(url):
-                                log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
-                                joined_any = True
-                            else:
-                                log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
+                for row in resp.buttons:
+                    for btn in row:
+                        url = getattr(btn, "url", None)
+                        if not url or ("t.me/" not in url and "telegram.me/" not in url):
+                            continue
+                        # دکمه‌ای که خودش یه دیپ‌لینک دیگه‌ست (start=...) رو اینجا
+                        # عضو نمیشیم؛ اون میره تو مرحله‌ی «دنبال کردن لینک بعدی»
+                        if parse_start_link(url):
+                            log.info(
+                                "deeplink: %s -> دکمه‌ی «%s» یه دیپ‌لینکه (%s)، نه کانال، رد میشه از این مرحله",
+                                bot_username, getattr(btn, "text", ""), url,
+                            )
+                            continue
+                        # ممکنه این دکمه یه ربات تبلیغاتی باشه که وسط گیت عضویت
+                        # قاطی شده، نه یه کانال واقعی؛ قبل از تلاش برای جوین،
+                        # مطمئن میشیم واقعاً کانال/گروهه.
+                        if not await is_joinable_channel_link(url):
+                            log.info(
+                                "deeplink: %s -> دکمه‌ی «%s» (%s) کانال/گروه نیست (احتمالاً ربات تبلیغاتیه)، رد میشه",
+                                bot_username, getattr(btn, "text", ""), url,
+                            )
+                            continue
+                        log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: «%s» -> %s", bot_username, getattr(btn, "text", ""), url)
+                        if await join_from_identifier(url):
+                            log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
+                            joined_any = True
+                        else:
+                            log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
 
                 if joined_any:
                     await asyncio.sleep(3)
 
                 # دکمه‌ی «چک عضویت» (بدون url، یه دکمه‌ی callback) رو بزن
                 clicked = False
-                if resp.buttons:
-                    for row in resp.buttons:
-                        for btn in row:
-                            if getattr(btn, "url", None) is None:
-                                try:
-                                    log.info("deeplink: %s -> کلیک روی دکمه‌ی تایید عضویت", bot_username)
-                                    await call_with_flood_retry(
-                                        lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
-                                    )
-                                    clicked = True
-                                except Exception as e:
-                                    log.warning("click failed for a button in %s: %s", bot_username, e)
+                for row in resp.buttons:
+                    for btn in row:
+                        if getattr(btn, "url", None) is None:
+                            try:
+                                log.info("deeplink: %s -> کلیک روی دکمه‌ی تایید عضویت", bot_username)
+                                await call_with_flood_retry(
+                                    lambda b=btn: b.click(), context=f"کلیک دکمه‌ی تایید عضویت در {bot_username}"
+                                )
+                                clicked = True
+                            except Exception as e:
+                                log.warning("click failed for a button in %s: %s", bot_username, e)
 
                 if not joined_any and not clicked:
-                    if not resp.buttons:
-                        # این پیام نه فایل داشت نه هیچ دکمه‌ای (نه اینلاین نه
-                        # کیبورد معمولی)؛ شاید فقط یه پیام میانیه (مثلاً «صبر
-                        # کن...») و پیام واقعی چند ثانیه دیگه میاد.
-                        log.info(
-                            "deeplink: %s -> نه فایل نه دکمه‌ای تو این پیام نبود، تا ۱۵ ثانیه منتظر پیام بعدی می‌مونیم",
-                            bot_username,
-                        )
-                        try:
-                            resp = await conv.get_response(timeout=15)
-                            continue
-                        except asyncio.TimeoutError:
-                            log.info("deeplink: %s -> پیام دیگه‌ای نیومد", bot_username)
-                            break
                     # دکمه بود ولی هیچ‌کدوم قابل استفاده نبودن (نه لینک عضویت
                     # قابل‌تشخیص، نه دکمه‌ی تایید)؛ دیگه کاری از دستمون بر
                     # نمیاد، بریم سراغ چک کردن لینک بعدی توی متن/دکمه‌ها.
@@ -289,6 +301,9 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
 
                 log.info("deeplink: %s -> دوباره منتظر پاسخ جدید هستیم", bot_username)
                 resp = await conv.get_response()
+
+            if advanced_to_next_hop:
+                continue
 
             if resp.document or resp.photo or resp.file:
                 log.info("deeplink: %s -> فایل رسید (بدون دانلود، مستقیم فوروارد میشه)", bot_username)
