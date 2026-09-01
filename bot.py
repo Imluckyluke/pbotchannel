@@ -201,6 +201,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                 log.info("deeplink: %s -> متن این پیام: %r", bot_username, resp.raw_text)
 
             advanced_to_next_hop = False
+            unresolved_join_links = set()
 
             for attempt in range(max_inner_retries):
                 if resp.document or resp.photo or resp.file:
@@ -224,14 +225,19 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                     # نه فایل، نه دکمه، نه لینکی تو متن؛ شاید فقط یه پیام
                     # میانیه (مثلاً «صبر کن...») و پیام واقعی چند ثانیه دیگه میاد.
                     log.info(
-                        "deeplink: %s -> نه فایل، نه دکمه، نه لینکی پیدا شد؛ تا ۱۵ ثانیه منتظر پیام بعدی می‌مونیم",
-                        bot_username,
+                        "deeplink: %s -> نه فایل، نه دکمه، نه لینکی پیدا شد؛ متن: %r؛ تا ۱۵ ثانیه منتظر پیام بعدی می‌مونیم",
+                        bot_username, resp.raw_text,
                     )
                     try:
                         resp = await conv.get_response(timeout=15)
                         continue
                     except asyncio.TimeoutError:
                         log.info("deeplink: %s -> پیام دیگه‌ای نیومد", bot_username)
+                        if unresolved_join_links:
+                            raise RuntimeError(
+                                f"بعد از باز کردن «{bot_username}»، فایل نیومد. این لینک(های) عضویت جوین نشدن "
+                                f"(احتمالاً منقضی/نامعتبرن): {', '.join(unresolved_join_links)}"
+                            )
                         raise RuntimeError(f"بعد از باز کردن «{bot_username}»، نه فایل اومد نه لینک/دکمه‌ای پیدا شد.")
 
                 log.info(
@@ -247,6 +253,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                         )
 
                 joined_any = False
+                failed_urls = []
                 for row in resp.buttons:
                     for btn in row:
                         url = getattr(btn, "url", None)
@@ -275,6 +282,26 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                             joined_any = True
                         else:
                             log.warning("deeplink: %s -> عضویت در %s ناموفق", bot_username, url)
+                            failed_urls.append(url)
+
+                # بعضی جوین‌ها ممکنه به خاطر فلود‌ویتِ پشت‌سرهم یا تایمینگ
+                # موقتاً شکست بخورن؛ یه بار دیگه با کمی مکث امتحان می‌کنیم.
+                if failed_urls:
+                    await asyncio.sleep(4)
+                    still_failed = []
+                    for url in failed_urls:
+                        log.info("deeplink: %s -> تلاش دوباره برای عضویت در %s", bot_username, url)
+                        if await join_from_identifier(url):
+                            log.info("deeplink: %s -> عضویت در %s موفق (تلاش دوم)", bot_username, url)
+                            joined_any = True
+                        else:
+                            still_failed.append(url)
+                    if still_failed:
+                        log.warning(
+                            "deeplink: %s -> این لینک‌ها بعد از ۲ تلاش هنوز عضو نشدن (احتمالاً منقضی/نامعتبرن): %s",
+                            bot_username, still_failed,
+                        )
+                        unresolved_join_links.update(still_failed)
 
                 if joined_any:
                     await asyncio.sleep(3)
@@ -316,6 +343,11 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                 current_link = next_link
                 continue
 
+            if unresolved_join_links:
+                raise RuntimeError(
+                    f"بعد از باز کردن «{bot_username}»، فایل نیومد. این لینک(های) عضویت جوین نشدن "
+                    f"(احتمالاً منقضی/نامعتبرن): {', '.join(unresolved_join_links)}"
+                )
             raise RuntimeError(f"بعد از باز کردن «{bot_username}»، نه فایل اومد نه لینک جدیدی پیدا شد.")
 
     raise RuntimeError(f"بعد از {max_hops} مرحله (دنبال کردن لینک‌های زنجیره‌ای)، فایل نهایی گرفته نشد: {link}")
@@ -490,9 +522,10 @@ async def join_from_identifier(identifier: str) -> bool:
     except UserAlreadyParticipantError:
         return True
     except InviteHashExpiredError:
+        log.warning("join failed for %s: لینک دعوت منقضی/نامعتبره (InviteHashExpiredError)", identifier)
         return False
     except Exception as e:
-        log.warning("join failed for %s: %s", identifier, e)
+        log.warning("join failed for %s: %s: %s", identifier, type(e).__name__, e)
         return False
 
 
