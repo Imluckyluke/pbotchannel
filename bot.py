@@ -1206,14 +1206,19 @@ def build_channel_message(raw_text: str, link: str, channel_display: str, trigge
 
     # وقتی کپشن از یه پست کانال مبدا کپی شده (نه دستیِ خودمون)، به‌جای
     # placeholder «ایدی کانال»، ته متن آیدی/یوزرنیم واقعیِ خودِ کانال مبدا
-    # هست (چون اونا هم قبلاً جای این placeholder رو با آیدی خودشون پر
-    # کردن). آخرین @یوزرنیمِ توی متن رو با آیدیِ کانال مقصدِ ما جایگزین
-    # می‌کنیم تا این برچسب درست بشه.
+    # هست — گاهی حتی دو بار تکرار شده یا دو آیدی متفاوت (معمولاً توی سه
+    # خط آخر پیام). همه‌ی @یوزرنیم‌هایی که توی سه خط آخر پیدا بشن رو با
+    # آیدیِ کانال مقصدِ ما جایگزین می‌کنیم تا این برچسب(ها) درست بشه،
+    # بدون اینکه به mentionهای احتمالیِ وسط متن (که ربطی به برچسب کانال
+    # ندارن) دست بزنیم.
     if channel_display:
-        mentions = list(CHANNEL_MENTION_RE.finditer(text))
-        if mentions:
-            last = mentions[-1]
-            text = text[:last.start()] + channel_display + text[last.end():]
+        lines = text.split("\n")
+        tail_start = max(0, len(lines) - 3)
+        tail = "\n".join(lines[tail_start:])
+        new_tail = CHANNEL_MENTION_RE.sub(channel_display, tail)
+        if new_tail != tail:
+            lines[tail_start:] = new_tail.split("\n")
+            text = "\n".join(lines)
 
     text = text.replace(trigger_word, f'<a href="{link}">{trigger_word}</a>')
     return text
