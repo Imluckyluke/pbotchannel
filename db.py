@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import time
 
 # روی ریلوی حتما این رو با یه Volume مقداردهی کن (مثلا /data/data.sqlite3)
 # وگرنه سر هر ری‌دیپلوی، سشن و تنظیمات پاک میشن.
@@ -16,6 +17,7 @@ DEFAULTS = {
     "watch_max_per_day": "5",          # تعداد پست روزانه
     "post_template": "",               # قالب جایگزین وقتی پست کانال مبدا کپشن نداره
     "auto_paused": "0",                # توقف کلی ارسال/مانیتور خودکار (۱ یعنی متوقفه)
+    "gate_leave_minutes": "30",        # چند دقیقه بعد از عضویت موقت (برای گیت‌ها) خودکار لفت بده
 }
 
 
@@ -48,6 +50,11 @@ def init_db(bootstrap_admin_ids=None):
     existing_cols = [r["name"] for r in cur.execute("PRAGMA table_info(dest_channels)").fetchall()]
     if "enabled" not in existing_cols:
         cur.execute("ALTER TABLE dest_channels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS gate_joins ("
+        "target TEXT PRIMARY KEY, "
+        "leave_at INTEGER NOT NULL)"
+    )
     cur.execute(
         "CREATE TABLE IF NOT EXISTS src_channels ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -304,6 +311,37 @@ def last_download_time():
     row = conn.execute("SELECT MAX(downloaded_at) AS m FROM downloaded").fetchone()
     conn.close()
     return row["m"] or 0
+
+
+# ---------------------------------------------------------------- gate joins (عضویت‌های موقت برای گیت)
+def schedule_gate_leave(target, leave_delay_seconds):
+    """یه کانال/گروه رو که موقتاً برای رد کردن گیت عضویت جوین شدیم، برای لفت
+    دادنِ خودکار بعد از leave_delay_seconds ثانیه برنامه‌ریزی میکنه."""
+    conn = _conn()
+    leave_at = int(time.time()) + int(leave_delay_seconds)
+    conn.execute(
+        "INSERT INTO gate_joins (target, leave_at) VALUES (?, ?) "
+        "ON CONFLICT(target) DO UPDATE SET leave_at = excluded.leave_at",
+        (str(target), leave_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def due_gate_leaves():
+    """آیدیِ کانال/گروه‌هایی که زمان لفت دادنشون رسیده رو برمیگردونه."""
+    conn = _conn()
+    now = int(time.time())
+    rows = conn.execute("SELECT target FROM gate_joins WHERE leave_at <= ?", (now,)).fetchall()
+    conn.close()
+    return [r["target"] for r in rows]
+
+
+def remove_gate_join(target):
+    conn = _conn()
+    conn.execute("DELETE FROM gate_joins WHERE target = ?", (str(target),))
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------- backup / restore

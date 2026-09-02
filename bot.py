@@ -8,11 +8,11 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.types import (
     MessageEntityTextUrl, MessageEntityUrl,
-    Channel, Chat,
+    Channel, Chat, ChatInviteAlready,
 )
 from telethon.errors import (
     RPCError,
@@ -59,7 +59,7 @@ LOGIN_SESSIONS = {}    # user_id -> {client, phone, phone_code_hash, code}
 CORE_SETTINGS = [
     ("bot1_username", "🤖 ربات اول"),
     ("bot2_username", "🤖 ربات دوم"),
-    ("trigger_word", "🔗 کلمه‌ی تبدیل به لینک"),
+    ("trigger_word", "🔗 کلمه(های) تبدیل به لینک (با کاما جدا کن)"),
 ]
 
 # تنظیمات مربوط به بررسی خودکار کانال‌های مبدا
@@ -67,10 +67,11 @@ WATCH_SETTINGS = [
     ("watch_interval_minutes", "⏱ فاصله زمانی بین هر پست (دقیقه)"),
     ("watch_max_per_day", "🔢 تعداد پست روزانه"),
     ("post_template", "📝 قالب جایگزین (بدون کپشن مبدا)"),
+    ("gate_leave_minutes", "🚪 لفت از کانال‌های گیت بعد از (دقیقه، ۰=هیچوقت)"),
 ]
 
 SETTINGS_LABELS = {key: label for key, label in CORE_SETTINGS + WATCH_SETTINGS}
-NUMERIC_SETTINGS = {"watch_interval_minutes", "watch_max_per_day"}
+NUMERIC_SETTINGS = {"watch_interval_minutes", "watch_max_per_day", "gate_leave_minutes"}
 
 TEMP_DEST_CHANNEL = {}    # user_id -> target موقت هنگام افزودن کانال مقصد جدید
 PENDING_MSG = {}          # user_id -> (chat_id, message_id) پیام پنلی که باید ادیت بشه
@@ -174,6 +175,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
       میکنه (max_hops بار) تا برسه به جایی که واقعاً فایل یا گیت عضویت باشه."""
     current_link = link
     visited = set()
+    gate_leave_minutes = int(db.get_setting("gate_leave_minutes") or 30) or None
 
     for hop in range(max_hops):
         if current_link in visited:
@@ -277,7 +279,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                             )
                             continue
                         log.info("deeplink: %s -> دکمه‌ی عضویت پیدا شد: «%s» -> %s", bot_username, getattr(btn, "text", ""), url)
-                        if await join_from_identifier(url):
+                        if await join_from_identifier(url, schedule_leave_minutes=gate_leave_minutes):
                             log.info("deeplink: %s -> عضویت در %s موفق", bot_username, url)
                             joined_any = True
                         else:
@@ -291,7 +293,7 @@ async def fetch_file_from_start_link(link: str, max_hops: int = 6, max_inner_ret
                     still_failed = []
                     for url in failed_urls:
                         log.info("deeplink: %s -> تلاش دوباره برای عضویت در %s", bot_username, url)
-                        if await join_from_identifier(url):
+                        if await join_from_identifier(url, schedule_leave_minutes=gate_leave_minutes):
                             log.info("deeplink: %s -> عضویت در %s موفق (تلاش دوم)", bot_username, url)
                             joined_any = True
                         else:
@@ -391,6 +393,24 @@ async def resolve_channel_entity(target):
         log.info("resolve_channel_entity: کش پیدا نشد برای %s، در حال بازسازی کش دیالوگ‌ها", target)
         await warm_up_entity_cache()
         return await user.get_entity(ident)
+
+
+async def process_due_gate_leaves():
+    """کانال/گروه‌هایی که موقتاً برای رد کردن یه گیت عضویت جوین شده بودیم و
+    زمان لفت‌دادنشون رسیده رو ترک میکنه (کانال‌های مبدا/مقصدِ اصلی هیچوقت
+    اینجا نمیان، چون فقط joinهای گیت با schedule_leave_minutes ثبت میشن)."""
+    if not session_connected():
+        return
+    due = db.due_gate_leaves()
+    for target in due:
+        try:
+            entity = await resolve_channel_entity(target)
+            await call_with_flood_retry(lambda: user(LeaveChannelRequest(entity)), context=f"ترک {target}")
+            log.info("gate-leave: از %s لفت داده شد", target)
+        except Exception as e:
+            log.warning("gate-leave: نتونستم از %s لفت بدم: %s", target, e)
+        finally:
+            db.remove_gate_join(target)
 
 
 async def list_session_channels():
@@ -497,27 +517,47 @@ async def is_joinable_channel_link(url: str) -> bool:
     return not getattr(entity, "bot", False) and type(entity).__name__ != "User"
 
 
-async def join_from_identifier(identifier: str) -> bool:
-    """identifier: لینک t.me، یوزرنیم @، یا آیدی عددی کانالی که سشن از قبل عضوشه."""
+async def join_from_identifier(identifier: str, *, schedule_leave_minutes: int = None) -> bool:
+    """identifier: لینک t.me، یوزرنیم @، یا آیدی عددی کانالی که سشن از قبل عضوشه.
+    schedule_leave_minutes: اگه داده بشه، بعد از یه عضویتِ *واقعی و تازه*
+    (نه وقتی از قبل عضو بودیم)، این تعداد دقیقه بعد خودکار از اون کانال/گروه
+    لفت داده میشه — برای عضویت‌های موقتِ گیت، نه کانال‌های مبدا/مقصدِ اصلی."""
     m = INVITE_LINK_RE.search(identifier)
     try:
         if m and ("/+" in identifier or "joinchat" in identifier):
-            await call_with_flood_retry(
-                lambda: user(ImportChatInviteRequest(m.group(1))),
+            invite_hash = m.group(1)
+            # اول چک کن شاید از قبل عضو باشیم؛ بدون این چک، تلاش برای عضویت
+            # مجدد با همون لینک دعوت گاهی به‌جای موفقیت ساده، خطا میده.
+            try:
+                check = await user(CheckChatInviteRequest(invite_hash))
+                if isinstance(check, ChatInviteAlready):
+                    log.info("join: %s از قبل عضو بودیم، نیازی به عضویت دوباره نیست", identifier)
+                    return True  # از قبل عضو بودیم؛ لفت‌دادن براش برنامه‌ریزی نمیشه
+            except Exception:
+                pass  # چک نشد، برو سراغ عضویت معمولی
+            result = await call_with_flood_retry(
+                lambda: user(ImportChatInviteRequest(invite_hash)),
                 context=f"عضویت در {identifier}",
             )
+            joined_id = result.chats[0].id if getattr(result, "chats", None) else None
         elif m:
-            await call_with_flood_retry(
+            result = await call_with_flood_retry(
                 lambda: user(JoinChannelRequest(m.group(1))),
                 context=f"عضویت در {identifier}",
             )
+            joined_id = result.chats[0].id if getattr(result, "chats", None) else None
         elif identifier.startswith("@"):
-            await call_with_flood_retry(
+            result = await call_with_flood_retry(
                 lambda: user(JoinChannelRequest(identifier)),
                 context=f"عضویت در {identifier}",
             )
+            joined_id = result.chats[0].id if getattr(result, "chats", None) else None
         else:
-            return True  # آیدی عددی: فرض میکنیم از قبل عضوه
+            return True  # آیدی عددی: فرض میکنیم از قبل عضوه، لفت‌دادن براش برنامه‌ریزی نمیشه
+
+        if schedule_leave_minutes and joined_id:
+            db.schedule_gate_leave(joined_id, schedule_leave_minutes * 60)
+            log.info("join: %s (id=%s) بعد از %s دقیقه خودکار لفت داده میشه", identifier, joined_id, schedule_leave_minutes)
         return True
     except UserAlreadyParticipantError:
         return True
@@ -1104,11 +1144,13 @@ async def pending_input_handler(event):
 
     # حالت عادی: یکی از تنظیمات ساده
     if pending_key in NUMERIC_SETTINGS:
-        if not value.isdigit() or int(value) <= 0:
+        min_allowed = 0 if pending_key == "gate_leave_minutes" else 1
+        if not value.isdigit() or int(value) < min_allowed:
             label = SETTINGS_LABELS.get(pending_key, pending_key)
+            hint = "مثلا 0 یا 30" if pending_key == "gate_leave_minutes" else "مثلا 30"
             await send_or_edit(
                 admin_id, event,
-                f"{label}\nفقط یه عدد صحیح مثبت قبول میشه (مثلا 30)، دوباره بفرست:",
+                f"{label}\nفقط یه عدد صحیح {'نامنفی' if min_allowed == 0 else 'مثبت'} قبول میشه ({hint})، دوباره بفرست:",
                 buttons=[[Button.inline("انصراف", data="menu:main", style="danger")]],
             )
             raise events.StopPropagation  # PENDING پاک نمیشه تا دوباره امتحان کنه
@@ -1185,10 +1227,10 @@ async def process_file(event):
             final_link = await get_link_from_bot2(link1)
 
         db.set_last_link(event.sender_id, final_link)
-        trigger_word = db.get_setting("trigger_word") or "مشاهده"
+        trigger_words_display = "، ".join(f"«{w}»" for w in get_trigger_words())
         await status.edit(
             f"لینک نهایی:\n{final_link}\n\n"
-            f"حالا کپشن رو بفرست (باید کلمه‌ی «{trigger_word}» توش باشه تا پست بشه)."
+            f"حالا کپشن رو بفرست (باید یکی از این‌ها توش باشه تا پست بشه: {trigger_words_display})."
         )
     except Exception as e:
         log.exception("process_file failed")
@@ -1201,7 +1243,28 @@ async def process_file(event):
 CHANNEL_MENTION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,31}")
 
 
-def build_channel_message(raw_text: str, link: str, channel_display: str, trigger_word: str) -> str:
+def get_trigger_words() -> list:
+    """تنظیم «کلمه‌ی تبدیل به لینک» میتونه چندتا کلمه/عبارت با کاما جدا شده
+    باشه (مثلاً «مشاهده, مشاهده فیلم, دانلود🎲»)؛ اینجا لیستش می‌کنیم،
+    طولانی‌ترها اول (تا عبارت‌های دقیق‌تر روی حالت‌های کوتاه‌تر اولویت داشته
+    باشن، مثلاً «مشاهده فیلم» قبل از «مشاهده»)."""
+    raw = db.get_setting("trigger_word") or "مشاهده"
+    words = [w.strip() for w in raw.split(",") if w.strip()]
+    words.sort(key=len, reverse=True)
+    return words or ["مشاهده"]
+
+
+def find_trigger_word_in_text(text: str):
+    """اولین کلمه/عبارتِ تنظیم‌شده که واقعاً توی متن پیدا بشه رو برمیگردونه."""
+    if not text:
+        return None
+    for w in get_trigger_words():
+        if w in text:
+            return w
+    return None
+
+
+def build_channel_message(raw_text: str, link: str, channel_display: str, trigger_word_setting: str = None) -> str:
     text = raw_text.replace("ایدی کانال", channel_display or "")
 
     # وقتی کپشن از یه پست کانال مبدا کپی شده (نه دستیِ خودمون)، به‌جای
@@ -1220,7 +1283,9 @@ def build_channel_message(raw_text: str, link: str, channel_display: str, trigge
             lines[tail_start:] = new_tail.split("\n")
             text = "\n".join(lines)
 
-    text = text.replace(trigger_word, f'<a href="{link}">{trigger_word}</a>')
+    trigger = find_trigger_word_in_text(text)
+    if trigger:
+        text = text.replace(trigger, f'<a href="{link}">{trigger}</a>', 1)
     return text
 
 
@@ -1230,8 +1295,7 @@ async def post_to_channel(channel: dict, raw_text: str, link: str):
     هیچ کانال یا ربات اول/دومی باشه؛ فقط پنل تنظیمات رو نشون میده."""
     if not session_connected():
         raise RuntimeError("سشن وصل نیست؛ از پنل روی «ورود با شماره» یا «Session String» بزن")
-    trigger_word = db.get_setting("trigger_word") or "مشاهده"
-    final_text = build_channel_message(raw_text, link, channel["display"], trigger_word)
+    final_text = build_channel_message(raw_text, link, channel["display"])
     name = channel["display"] or channel["target"]
     target = channel["target"]
     peer = int(target) if str(target).lstrip("-").isdigit() else target
@@ -1358,6 +1422,11 @@ async def poll_src_channels():
                     await notify_admins("✅ سشن دوباره وصل و معتبره؛ ارسال خودکار از سر گرفته شد.")
                 SESSION_ALERT_SENT = False
 
+            if healthy:
+                # ترک کانال‌های موقتِ گیت که زمانشون رسیده - فارغ از توقف/فعال
+                # بودن ارسال خودکار، چون ربطی به پست کردن نداره.
+                await process_due_gate_leaves()
+
             paused = db.get_setting("auto_paused") == "1"
             if healthy and not paused:
                 elapsed = time.time() - db.last_download_time()
@@ -1454,8 +1523,7 @@ async def file_handler(event):
 async def template_handler(event):
     if not is_admin(event.sender_id):
         return
-    trigger_word = db.get_setting("trigger_word") or "مشاهده"
-    if trigger_word not in event.text:
+    if not find_trigger_word_in_text(event.text):
         return
 
     link = db.get_last_link(event.sender_id)
