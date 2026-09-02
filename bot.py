@@ -11,7 +11,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import (
-    MessageEntityTextUrl, MessageEntityUrl, MessageMediaPhoto, MessageMediaDocument,
+    MessageEntityTextUrl, MessageEntityUrl,
     Channel, Chat,
 )
 from telethon.errors import (
@@ -1381,20 +1381,14 @@ async def poll_src_channels():
                             source_link = extract_source_link(latest)
                             log.info("watch: %s -> link in latest message: %s", target, source_link or "پیدا نشد")
 
-                            # latest.photo/latest.document شورتکات‌های Telethon‌ان و برای
-                            # پیش‌نمایش لینک (webpage preview) هم truthy میشن؛ اینجا فقط
-                            # مدیای واقعیِ چسبیده به پیام رو حساب میکنیم، نه تامبنیل پیش‌نمایش.
-                            has_own_media = isinstance(latest.media, (MessageMediaPhoto, MessageMediaDocument))
-                            if not source_link and not has_own_media:
-                                log.info("watch: %s -> نه لینک داشت نه فایل چسبیده، رد شد", target)
+                            if not source_link:
+                                # فقط پست‌هایی که زیرشون لینک دارن پردازش میشن؛
+                                # پستی که خودش مستقیم فایل/عکس چسبیده داره (بدون
+                                # لینک) عمداً نادیده گرفته میشه.
+                                log.info("watch: %s -> لینکی زیر پست نبود (شاید فایل مستقیم بود)، رد شد", target)
                                 continue
 
-                            if source_link:
-                                dedup_key = source_link
-                            else:
-                                # حالت قدیمی: پست کانال مبدا خودش فایل چسبیده داره
-                                media_obj = latest.photo or latest.document
-                                dedup_key = str(media_obj.id) if media_obj else str(latest.id)
+                            dedup_key = source_link
 
                             if db.already_downloaded(dedup_key):
                                 log.info("watch: %s -> این پیام قبلاً پردازش شده، رد شد", target)
@@ -1403,26 +1397,18 @@ async def poll_src_channels():
                             source_caption = latest.raw_text or ""
 
                             try:
-                                if source_link:
-                                    # پست کانال مبدا فایل نداره، فقط یه دیپ‌لینک به یه ربات
-                                    # (مثل خودمون) داره؛ باید واردش بشیم، اگه گیت عضویت
-                                    # داشت عضو کانال‌هاش بشیم، و فایل رو ازش بگیریم.
-                                    log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
-                                    file_message = await fetch_file_from_start_link(source_link)
-                                    log.info("watch: %s -> پیام حاوی فایل از دیپ‌لینک گرفته شد", target)
-                                else:
-                                    # حالت قدیمی: پست کانال مبدا خودش فایل چسبیده داره؛
-                                    # چیزی دانلود نمی‌کنیم، خودِ پیام رو مستقیم به ربات
-                                    # اول می‌فرستیم (Telethon سمت سرور کپی می‌کنه).
-                                    log.info("watch: %s -> فایل مستقیم روی خود پست، بدون دانلود فرستاده میشه", target)
-                                    file_message = latest
+                                # واردِ دیپ‌لینک میشیم، اگه گیت عضویت داشت عضو
+                                # کانال‌هاش می‌شیم، و فایل رو ازش می‌گیریم.
+                                log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
+                                file_message = await fetch_file_from_start_link(source_link)
+                                log.info("watch: %s -> پیام حاوی فایل از دیپ‌لینک گرفته شد", target)
                             except Exception as e:
                                 # جلوی تلاش بی‌نهایتِ همین پیام رو می‌گیریم و به ادمین خبر میدیم
                                 db.mark_downloaded(dedup_key, target)
                                 log.warning("watch: %s -> نتونست فایل رو بگیره: %s", target, e, exc_info=True)
                                 await notify_admins(
                                     f"⚠️ نتونستم فایل رو از پستِ «{ch['title'] or target}» بگیرم.\n"
-                                    f"لینک: {source_link or '(فایل مستقیم روی خود پست)'}\nخطا: {e}"
+                                    f"لینک: {source_link}\nخطا: {e}"
                                 )
                                 continue
 
