@@ -1539,6 +1539,7 @@ async def auto_post_after_watch(source_title: str, final_link: str, source_capti
 async def poll_src_channels():
     global SESSION_ALERT_SENT
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    log.info("watch: پروسه‌ی مانیتور کانال‌های مبدا استارت شد")
     while True:
         interval_minutes = int(db.get_setting("watch_interval_minutes") or 60)
         interval = interval_minutes * 60
@@ -1546,6 +1547,7 @@ async def poll_src_channels():
         try:
             healthy = await session_health_ok()
             if not healthy:
+                log.warning("watch: سشن قطع/نامعتبره؛ این دور رد میشه (نه چک کانال مبدا نه لفت گیت)")
                 if not SESSION_ALERT_SENT:
                     await notify_admins(
                         "⚠️ سشن (یوزربات) قطع شده یا دیگه معتبر نیست؛ ارسال خودکار متوقفه.\n"
@@ -1563,9 +1565,19 @@ async def poll_src_channels():
                 await process_due_gate_leaves()
 
             paused = db.get_setting("auto_paused") == "1"
+            if paused:
+                log.info("watch: ارسال خودکار از پنل متوقف شده (auto_paused=1)؛ این دور رد میشه")
             if healthy and not paused:
                 elapsed = time.time() - db.last_download_time()
-                if elapsed >= interval and db.downloads_in_last_24h() < max_per_day:
+                daily_count = db.downloads_in_last_24h()
+                if daily_count >= max_per_day:
+                    log.info("watch: سقف روزانه (%s) پر شده؛ این دور رد میشه", max_per_day)
+                elif elapsed < interval:
+                    log.info(
+                        "watch: هنوز %.0f ثانیه مونده تا فاصله‌ی %s دقیقه‌ای بین پست‌ها تموم بشه، این دور رد میشه",
+                        interval - elapsed, interval_minutes,
+                    )
+                else:
                     log.info(
                         "watch: شروع دور بررسی کانال‌های مبدا (%s کانال، %.0f ثانیه از آخرین دانلود گذشته)",
                         len(db.list_src_channels()), elapsed,
@@ -1687,6 +1699,19 @@ async def template_handler(event):
 
 
 # ---------------------------------------------------------------- run
+async def poll_src_channels_supervisor():
+    """poll_src_channels خودش هر خطای داخلی رو می‌گیره و لاگ می‌کنه، ولی
+    این یه لایه‌ی محافظ اضافه‌ست: اگه به هر دلیل غیرمنتظره‌ای کلِ تابع
+    (نه فقط یه دور از حلقه‌ش) کرش کنه، به‌جای مردنِ ساکتِ کل مانیتور برای
+    همیشه، بعد از ۱۰ ثانیه دوباره راه‌اندازیش می‌کنه."""
+    while True:
+        try:
+            await poll_src_channels()
+        except Exception:
+            log.exception("poll_src_channels کاملاً کرش کرد؛ ۱۰ ثانیه دیگه دوباره راه‌اندازی میشه")
+            await asyncio.sleep(10)
+
+
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
 
@@ -1700,7 +1725,7 @@ async def main():
     else:
         log.warning("سشنی ثبت نشده - از /panel روی «ورود با شماره» یا «Session String» بزن")
 
-    asyncio.create_task(poll_src_channels())
+    asyncio.create_task(poll_src_channels_supervisor())
 
     log.info("bot started")
     await bot.run_until_disconnected()
