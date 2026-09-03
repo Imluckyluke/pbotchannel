@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import uuid
 import logging
 
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ from telethon.errors import (
     PasswordHashInvalidError,
     UserAlreadyParticipantError,
     InviteHashExpiredError,
+    InviteRequestSentError,
 )
 
 import db
@@ -77,6 +79,10 @@ TEMP_DEST_CHANNEL = {}    # user_id -> target موقت هنگام افزودن �
 PENDING_MSG = {}          # user_id -> (chat_id, message_id) پیام پنلی که باید ادیت بشه
 
 SESSION_ALERT_SENT = False   # تا وقتی سشن خرابه دوباره و دوباره به ادمین‌ها پیام نده
+
+# --------- حالت‌های موقتِ رفع‌مشکل دستی (فقط تو حافظه؛ با ری‌استارت پاک میشن) ---------
+RETRY_CONTEXTS = {}       # token -> {"title","target","source_link","source_caption","dedup_key"}
+MANUAL_POST_CONTEXTS = {}  # (admin_id, prompt_message_id) -> {"final_link","source_title"}
 
 
 # ---------------------------------------------------------------- helpers
@@ -564,6 +570,12 @@ async def join_from_identifier(identifier: str, *, schedule_leave_minutes: int =
     except InviteHashExpiredError:
         log.warning("join failed for %s: لینک دعوت منقضی/نامعتبره (InviteHashExpiredError)", identifier)
         return False
+    except InviteRequestSentError:
+        log.warning(
+            "join failed for %s: این گروه نیاز به تاییدِ ادمینشون داره (InviteRequestSentError)؛ "
+            "درخواست عضویت فرستاده شد ولی هنوز عضو نیستیم", identifier,
+        )
+        return False
     except Exception as e:
         log.warning("join failed for %s: %s: %s", identifier, type(e).__name__, e)
         return False
@@ -742,6 +754,27 @@ async def callback_handler(event):
         paused = db.get_setting("auto_paused") == "1"
         db.set_setting("auto_paused", "0" if paused else "1")
         await event.edit("پنل تنظیمات:", buttons=main_menu_buttons())
+        return
+
+    if data.startswith("retry:"):
+        token = data.split(":", 1)[1]
+        ctx = RETRY_CONTEXTS.get(token)
+        if not ctx:
+            await event.answer("این درخواست منقضی شده (شاید ربات ری‌استارت شده)؛ باید منتظر دور بعدی مانیتور بمونی.", alert=True)
+            return
+        await event.edit("در حال تلاش مجدد...")
+        try:
+            await process_source_link(
+                ctx["title"], ctx["target"], ctx["source_link"], ctx["source_caption"], ctx["dedup_key"]
+            )
+            RETRY_CONTEXTS.pop(token, None)
+            await event.edit("✅ این بار موفق شد و پست انجام شد.")
+        except Exception as e:
+            log.warning("retry failed for token %s: %s", token, e, exc_info=True)
+            await event.edit(
+                f"❌ بازم شکست خورد: {e}",
+                buttons=[[Button.inline("🔁 تلاش مجدد", data=f"retry:{token}")]],
+            )
         return
 
     if data == "backup:export":
@@ -1371,6 +1404,102 @@ async def handle_restore_upload(event):
         PENDING_MSG.pop(admin_id, None)
 
 
+async def process_source_link(title: str, target, source_link: str, source_caption: str, dedup_key: str):
+    """گرفتن فایل از دیپ‌لینکِ زیر پست کانال مبدا، رد کردن از ربات اول/دوم،
+    و پست کردن نهایی؛ هم مسیر اصلی مانیتور و هم دکمه‌ی «تلاش مجدد» از همین
+    استفاده میکنن. خطاها رو به بیرون پرتاب میکنه تا caller تصمیم بگیره."""
+    log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
+    file_message = await fetch_file_from_start_link(source_link)
+    log.info("watch: %s -> پیام حاوی فایل از دیپ‌لینک گرفته شد", target)
+
+    db.mark_downloaded(dedup_key, target)
+
+    async with session_lock:
+        log.info("watch: %s -> در حال ارسال فایل به ربات اول (بدون دانلود)", target)
+        link1 = await get_link_from_bot1(file_message)
+        log.info("watch: %s -> لینک ربات اول گرفته شد: %s", target, link1)
+        log.info("watch: %s -> در حال ارسال لینک به ربات دوم", target)
+        final_link = await get_link_from_bot2(link1)
+        log.info("watch: %s -> لینک نهایی ربات دوم: %s", target, final_link)
+
+    log.info("watch: %s -> در حال پست به کانال‌های مقصد فعال", target)
+    await auto_post_after_watch(title, final_link, source_caption)
+    log.info("watch: %s -> پست کامل انجام شد ✅", target)
+
+
+def register_retry_context(title, target, source_link, source_caption, dedup_key) -> str:
+    token = uuid.uuid4().hex[:10]
+    RETRY_CONTEXTS[token] = {
+        "title": title, "target": target, "source_link": source_link,
+        "source_caption": source_caption, "dedup_key": dedup_key,
+    }
+    return token
+
+
+async def notify_admins_with_retry(text: str, token: str):
+    buttons = [[Button.inline("🔁 تلاش مجدد", data=f"retry:{token}")]]
+    for admin_id in db.list_admins():
+        try:
+            await bot.send_message(admin_id, text, buttons=buttons)
+        except Exception:
+            pass
+
+
+async def notify_admins_for_manual_post(source_title: str, source_caption: str, final_link: str):
+    """وقتی هیچ‌کدوم از کلمه‌های تنظیم‌شده تو کپشن پیدا نشه، به‌جای پست
+    خودکار بدون لینک، از ادمین می‌خوایم خودش متن نهایی (با لینک جاسازی‌شده)
+    رو بفرسته. با ریپلای‌کردن رو همین پیام، بدون نیاز به دستور خاصی."""
+    text = (
+        f"⚠️ توی کپشن پستِ «{source_title}» هیچ‌کدوم از کلمه‌های «کلمه(های) تبدیل به "
+        f"لینک» پیدا نشد، پس نمی‌تونم خودکار لینکش کنم.\n\n"
+        f"کپشن اصلی:\n{source_caption}\n\n"
+        f"لینک نهایی:\n{final_link}\n\n"
+        f"روی همین پیام ریپلای کن و متن نهایی (با لینک جاسازی‌شده، مثلاً با هایپرلینک "
+        f"کردن یه کلمه) رو بفرست تا دقیقاً همونو توی کانال‌های مقصدِ فعال پست کنم."
+    )
+    for admin_id in db.list_admins():
+        try:
+            sent = await bot.send_message(admin_id, text)
+            MANUAL_POST_CONTEXTS[(admin_id, sent.id)] = {
+                "final_link": final_link, "source_title": source_title,
+            }
+        except Exception:
+            pass
+
+
+async def handle_manual_post_fix(event, ctx: dict):
+    """ادمین با ریپلای، متن نهایی (که خودش لینک رو توش جاسازی کرده) رو
+    فرستاده؛ دقیقاً همون متن (با همون فرمت/هایپرلینکی که خودش گذاشته) رو
+    با سشن توی همه‌ی کانال‌های مقصدِ فعال پست میکنیم."""
+    channels = db.list_enabled_dest_channels()
+    if not channels:
+        await event.reply("کانال مقصد فعالی وجود نداره؛ از پنل روی «کانال‌های مقصد» بزن.")
+        return
+
+    ok, failed = [], []
+    for channel in channels:
+        name = channel["display"] or channel["target"]
+        try:
+            target = channel["target"]
+            peer = int(target) if str(target).lstrip("-").isdigit() else target
+            await call_with_flood_retry(
+                lambda: user.send_message(
+                    peer, event.raw_text, formatting_entities=event.message.entities, link_preview=False
+                ),
+                context=f"ارسال دستی به {name}",
+            )
+            ok.append(name)
+        except Exception as e:
+            failed.append(f"{name}: {e}")
+
+    lines = []
+    if ok:
+        lines.append("پست شد توی: " + "، ".join(ok))
+    if failed:
+        lines.append("ارسال با خطا مواجه شد:\n" + "\n".join(failed))
+    await event.reply("\n".join(lines) if lines else "هیچ کانالی برای ارسال پیدا نشد.")
+
+
 async def auto_post_after_watch(source_title: str, final_link: str, source_caption: str):
     """بعد از گرفتن لینک نهایی برای فایلی که مانیتور پیدا کرده، خودکار پست میکنه.
     قالب (کپشن) از همون پست کانال مبدا گرفته میشه؛ اگه پست مبدا کپشن نداشت،
@@ -1381,6 +1510,12 @@ async def auto_post_after_watch(source_title: str, final_link: str, source_capti
             f"فایل جدید از «{source_title}» گرفته شد ولی نه کپشنی داشت نه قالب جایگزین تنظیم شده.\n"
             f"لینک نهایی:\n{final_link}"
         )
+        return
+
+    if not find_trigger_word_in_text(template):
+        # هیچ‌کدوم از کلمه‌های تنظیم‌شده تو کپشن پیدا نشد؛ به‌جای پست کردن
+        # بدون لینک، از ادمین می‌خوایم خودش متن نهایی رو بفرسته.
+        await notify_admins_for_manual_post(source_title, template, final_link)
         return
 
     channels = db.list_enabled_dest_channels()
@@ -1464,36 +1599,25 @@ async def poll_src_channels():
                                 continue
 
                             source_caption = latest.raw_text or ""
+                            title = ch["title"] or str(target)
 
                             try:
-                                # واردِ دیپ‌لینک میشیم، اگه گیت عضویت داشت عضو
-                                # کانال‌هاش می‌شیم، و فایل رو ازش می‌گیریم.
-                                log.info("watch: %s -> در حال باز کردن دیپ‌لینک %s", target, source_link)
-                                file_message = await fetch_file_from_start_link(source_link)
-                                log.info("watch: %s -> پیام حاوی فایل از دیپ‌لینک گرفته شد", target)
+                                await process_source_link(title, target, source_link, source_caption, dedup_key)
                             except Exception as e:
-                                # جلوی تلاش بی‌نهایتِ همین پیام رو می‌گیریم و به ادمین خبر میدیم
-                                db.mark_downloaded(dedup_key, target)
-                                log.warning("watch: %s -> نتونست فایل رو بگیره: %s", target, e, exc_info=True)
-                                await notify_admins(
-                                    f"⚠️ نتونستم فایل رو از پستِ «{ch['title'] or target}» بگیرم.\n"
-                                    f"لینک: {source_link}\nخطا: {e}"
+                                # عمداً dedup_key رو مارک نمی‌کنیم؛ یعنی اگه تا دور بعدیِ
+                                # مانیتور حل نشه، خودش دوباره امتحان میکنه (نه فقط با
+                                # دکمه‌ی تلاش مجدد). با دکمه هم میشه فوری امتحان کرد،
+                                # مثلاً بعد از رفع دستیِ مشکل (جوین‌شدنِ خودت تو یه گروه).
+                                log.warning("watch: %s -> نتونست فایل رو بگیره/پست کنه: %s", target, e, exc_info=True)
+                                token = register_retry_context(title, target, source_link, source_caption, dedup_key)
+                                await notify_admins_with_retry(
+                                    f"⚠️ نتونستم فایل رو از پستِ «{title}» بگیرم/پست کنم.\n"
+                                    f"لینک: {source_link}\nخطا: {e}\n\n"
+                                    f"اگه لازمه دستی یه جایی رو جوین شدی، بعدش «تلاش مجدد» رو بزن "
+                                    f"(وگرنه خودش تا رسیدنِ نوبتِ بعدیِ مانیتور دوباره امتحان میکنه).",
+                                    token,
                                 )
                                 continue
-
-                            db.mark_downloaded(dedup_key, target)
-
-                            async with session_lock:
-                                log.info("watch: %s -> در حال ارسال فایل به ربات اول (بدون دانلود)", target)
-                                link1 = await get_link_from_bot1(file_message)
-                                log.info("watch: %s -> لینک ربات اول گرفته شد: %s", target, link1)
-                                log.info("watch: %s -> در حال ارسال لینک به ربات دوم", target)
-                                final_link = await get_link_from_bot2(link1)
-                                log.info("watch: %s -> لینک نهایی ربات دوم: %s", target, final_link)
-
-                            log.info("watch: %s -> در حال پست به کانال‌های مقصد فعال", target)
-                            await auto_post_after_watch(ch["title"] or str(target), final_link, source_caption)
-                            log.info("watch: %s -> پست کامل انجام شد ✅", target)
 
                             if db.downloads_in_last_24h() >= max_per_day:
                                 break
@@ -1523,6 +1647,13 @@ async def file_handler(event):
 async def template_handler(event):
     if not is_admin(event.sender_id):
         return
+
+    reply_id = event.message.reply_to_msg_id
+    if reply_id and (event.sender_id, reply_id) in MANUAL_POST_CONTEXTS:
+        ctx = MANUAL_POST_CONTEXTS.pop((event.sender_id, reply_id))
+        await handle_manual_post_fix(event, ctx)
+        raise events.StopPropagation
+
     if not find_trigger_word_in_text(event.text):
         return
 
